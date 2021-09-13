@@ -1,0 +1,7 @@
+<RCC>
+    <qresource prefix="/">
+        <file>main.qml</file>
+        <file>protoo.js</file>
+        <file>Packet.qml</file>
+    </qresource>
+</RCC>

@@ -1,0 +1,66 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>qrc;rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="test">
+      <UniqueIdentifier>{eeed25de-0f04-4b30-a30b-9b444d332b92}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="chai">
+      <UniqueIdentifier>{f9d01bda-e48d-43e3-b8c4-ca0ba95a20d4}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <QtRcc Include="qml.qrc">
+      <Filter>Resource Files</Filter>
+    </QtRcc>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="main.qml">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="packet.qml">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="protoo.js">
+      <Filter>Resource Files</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="test\test_video_capturer.cc">
+      <Filter>test</Filter>
+    </ClCompile>
+    <ClCompile Include="test\vcm_capturer.cc">
+      <Filter>test</Filter>
+    </ClCompile>
+    <ClCompile Include="QmlVideoFrame.cpp" />
+    <ClCompile Include="QmlWebSocket.cpp" />
+    <ClCompile Include="chai\PeerConnection.cpp">
+      <Filter>chai</Filter>
+    </ClCompile>
+    <ClCompile Include="chai\RtpPakcet.cpp">
+      <Filter>chai</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="test\test_video_capturer.h">
+      <Filter>test</Filter>
+    </ClInclude>
+    <ClInclude Include="test\vcm_capturer.h">
+      <Filter>test</Filter>
+    </ClInclude>
+    <ClInclude Include="chai\PeerConnection.h">
+      <Filter>chai</Filter>
+    </ClInclude>
+    <ClInclude Include="chai\RtpPakcet.h">
+      <Filter>chai</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <QtMoc Include="QmlVideoFrame.h" />
+    <QtMoc Include="QmlWebSocket.h" />
+  </ItemGroup>
+</Project>
