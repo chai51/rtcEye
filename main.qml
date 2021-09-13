@@ -50,7 +50,7 @@ Window {
             console.error("wss close");
         }
         onError: {
-            console.error("wss error,", errorMessage);
+            console.error("wss error, %s", errorMessage);
         }
         function notification(msg) {
             switch (msg.method) {
@@ -77,7 +77,7 @@ Window {
         }
         onMessage: {
             try {
-                console.info("weoskcet recv", msg);
+                console.info("weoskcet recv, %s", msg);
                 const raw = JSON.parse(msg);
                 if (raw.notification) {
                     notification(raw);
@@ -86,7 +86,7 @@ Window {
                 }
             }
             catch (error) {
-                console.error('parse() | invalid JSON:', error);
+                console.error('parse() | invalid JSON: %s', error.message);
             }
 
         }
@@ -132,7 +132,7 @@ Window {
                             if (type == "rtp") {
                                 packet.addRtp(msg);
                             } else if (type == "rtcp") {
-                                console.info("rtcp", msg);
+                                console.info("rtcp, %s", msg);
                             }
                         }
                     }
@@ -160,13 +160,13 @@ Window {
                             codec: "av1x",
                         });
 
-                        console.info("weoskcet send", JSON.stringify(request));
+                        console.info("publish send, %s", JSON.stringify(request));
                         wss.send(JSON.stringify(request));
                         Protoo.getResponse(request).then(function (data) {
-                            console.info("publish success", JSON.stringify(data));
+                            console.info("publish success, %s", JSON.stringify(data));
                             videoFrame.setRemoteDescription(data.description.sdp);
                         }).catch(function (err) {
-                            console.error(err);
+                            console.error("publish failed, %s", err.message);
                         });
                     }
                 }
@@ -184,24 +184,26 @@ Window {
                             constraints: { video: true, audio: true },
                         });
 
-                        console.info("weoskcet send", JSON.stringify(request));
+                        console.info("subscribe send, %s", JSON.stringify(request));
                         wss.send(JSON.stringify(request));
                         Protoo.getResponse(request).then(function (data) {
-                            console.info("subscribe success", JSON.stringify(data));
+                            console.info("subscribe success, %s", JSON.stringify(data));
                             videoFrame.setRemoteDescription(data.description.sdp);
 
-                            let answer = videoFrame.getLocalDescription();
+                            let answer = videoFrame.createAnswer();
                             const request2 = Protoo.createRequest("subscribe", {
                                 msid: data.msid,
                                 description: { type: "answer", sdp: answer },
                             });
-                            Protoo.getResponse(request).then(function (data) {
+                            console.info("subscribe send 2, %s", JSON.stringify(request2));
+                            wss.send(JSON.stringify(request2));
+                            Protoo.getResponse(request2).then(function (data) {
                                 console.info("subscribe success 2");
                             }).catch(function (err){
-                                console.error(err);
+                                console.error("subscribe failed 2, %s", err.message);
                             });
                         }).catch(function (err) {
-                            console.error(err);
+                            console.error("subscribe failed, %s", err.message);
                         });
                     }
                 }
