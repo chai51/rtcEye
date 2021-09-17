@@ -5,6 +5,9 @@
 #include <api/audio_codecs/opus/audio_decoder_opus.h>
 #include <common_video/h264/h264_common.h>
 #include <modules/rtp_rtcp/source/byte_io.h>
+#include <modules/rtp_rtcp/source/video_rtp_depacketizer_av1.h>
+#include <api/video/i420_buffer.h>
+#include <third_party/libyuv/include/libyuv/convert.h>
 
 #include <algorithm>
 #include <fstream>
@@ -26,18 +29,6 @@ const uint16_t kStapAHeaderSize = kNalHeaderSize + kLengthFieldSize;
 enum NalDefs : uint8_t { kFBit = 0x80, kNriMask = 0x60, kTypeMask = 0x1F };
 // Bit masks for FU (A and B) headers.
 enum FuDefs : uint8_t { kSBit = 0x80, kEBit = 0x40, kRBit = 0x20 };
-
-typedef enum {
-  OBU_SEQUENCE_HEADER = 1,
-  OBU_TEMPORAL_DELIMITER = 2,
-  OBU_FRAME_HEADER = 3,
-  OBU_TILE_GROUP = 4,
-  OBU_METADATA = 5,
-  OBU_FRAME = 6,
-  OBU_REDUNDANT_FRAME_HEADER = 7,
-  OBU_TILE_LIST = 8,
-  OBU_PADDING = 15,
-} OBU_TYPE;
 
 std::map<OBU_TYPE, std::string> obuType2String = {
     {OBU_TYPE::OBU_SEQUENCE_HEADER, "sequence header"},
@@ -1320,534 +1311,183 @@ nlohmann::json PayloadH264::parseSliceHeader(const uint8_t* buff,
   return slice_header;
 }
 
-nlohmann::json PayloadAV1::parse(const uint8_t* buff, uint16_t length) {
-  std::ostringstream oss;
+PayloadAV1::PayloadAV1() {}
 
-  rtc::ByteBufferReader payload(reinterpret_cast<const char*>(buff), length);
+nlohmann::json PayloadAV1::parse(const uint8_t* buff, uint16_t length) {
   /*
      0 1 2 3 4 5 6 7
     +-+-+-+-+-+-+-+-+
     |Z|Y| W |N|-|-|-|
     +-+-+-+-+-+-+-+-+
   */
-  uint8_t aggregation_header{0};
-  payload.ReadUInt8(&aggregation_header);
-  uint16_t continues_obu = (aggregation_header & 0b1000'0000u) >> 7;  // 非第一个OBU
-  uint16_t expect_continues_obu = (aggregation_header & 0b0100'0000u) >> 6;  // 非最后一个OBU
-  uint16_t num_expected_obus = (aggregation_header & 0b0011'0000u) >> 4;  // OBU元素个数
+  uint8_t aggregation_header = buff[0];
+  uint16_t continues_obu =
+      (aggregation_header & 0b1000'0000u) >> 7;  // 非第一个OBU
+  uint16_t expect_continues_obu =
+      (aggregation_header & 0b0100'0000u) >> 6;  // 非最后一个OBU
+  uint16_t num_expected_obus =
+      (aggregation_header & 0b0011'0000u) >> 4;  // OBU元素个数
   uint16_t frame_key = (aggregation_header & 0b0000'1000u) >> 3;  // 关键帧
+    
+  payloads_.push_back({buff, length});
+  if (expect_continues_obu == 1) {
+    return WEBRTC_VIDEO_CODEC_OK;
+  }
 
-  nlohmann::json obus = {
-    { "aggregation_header", {
-      {"continues_obu", continues_obu},
-      {"expect_continues_obu", expect_continues_obu},
-      {"num_expected_obus", num_expected_obus},},
-    },
-    {"payload_length", length},
-    {"video_codec", "av1"},
-    {"frame_key", frame_key},
-    {"obus", nlohmann::json::array()},
-  };
+  webrtc::VideoRtpDepacketizerAv1 depacketizer;
+  
+  std::vector<rtc::ArrayView<const uint8_t>> rtp_payloads(payloads_.begin(), payloads_.end());
+  rtc::scoped_refptr<webrtc::EncodedImageBuffer> bitstream =
+      depacketizer.AssembleFrame(rtp_payloads);
+  payloads_.clear();
 
-  for (int obu_index = 1; payload.Length() > 0; ++obu_index) {
-    bool has_fragment_size = (obu_index != num_expected_obus);
-    uint64_t fragment_size{0};
-    if (has_fragment_size) {
-      payload.ReadUVarint(&fragment_size);
-    } else {
-      fragment_size = payload.Length();
-    }
+  if (!context_) {
+    context_.reset(new aom_codec_ctx_t);
 
-    buffer_.reset(new rtc::BitBuffer((const uint8_t*)payload.Data(), fragment_size));
+    aom_codec_dec_cfg_t config = {8u,  // Max # of threads.
+                                  0,   // Frame width set after decode.
+                                  0,   // Frame height set after decode.
+                                  1};  // Enable low-bit-depth code path.
+    aom_codec_err_t ret =
+        aom_codec_dec_init(context_.get(), aom_codec_av1_dx(), &config, 0);
 
-    obus["obus"].push_back({
-        {"fragment_length", fragment_size},
-        {"fragment", open_bitstream_unit(fragment_size)},
-    });
-
-    if (fragment_size > 0) {
-      payload.Consume(fragment_size);
+    if (ret != AOM_CODEC_OK) {
+      RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::InitDecode returned " << ret
+                          << " on aom_codec_dec_init.";
+      context_.reset();
+      return WEBRTC_VIDEO_CODEC_OK;
     }
   }
 
-  return obus;
+  aom_codec_err_t ret =
+      aom_codec_decode(context_.get(), bitstream->data(), bitstream->size(),
+                       /*user_priv=*/nullptr);
+  if (ret != AOM_CODEC_OK) {
+    RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::Decode returned " << ret
+                        << " on aom_codec_decode.";
+    return nlohmann::json();
+  }
+
+  // Get decoded frame data.
+  int corrupted_frame = 0;
+  aom_codec_iter_t iter = nullptr;
+  while (aom_image_t* decoded_image =
+             aom_codec_get_frame(context_.get(), &iter)) {
+    if (aom_codec_control(context_.get(), AOMD_GET_FRAME_CORRUPTED,
+                          &corrupted_frame)) {
+      RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::Decode "
+                             "AOM_GET_FRAME_CORRUPTED.";
+    }
+    // Check that decoded image format is I420 and has 8-bit depth.
+    if (decoded_image->fmt != AOM_IMG_FMT_I420) {
+      RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::Decode invalid image format";
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+
+    // Return decoded frame data.
+    int qp;
+    ret = aom_codec_control(context_.get(), AOMD_GET_LAST_QUANTIZER, &qp);
+    if (ret != AOM_CODEC_OK) {
+      RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::Decode returned " << ret
+                          << " on control AOME_GET_LAST_QUANTIZER.";
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+
+    // Allocate memory for decoded frame.
+    rtc::scoped_refptr<webrtc::I420Buffer> buffer =
+        buffer_pool_.CreateI420Buffer(decoded_image->d_w, decoded_image->d_h);
+    if (!buffer.get()) {
+      // Pool has too many pending frames.
+      RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::Decode returned due to lack of"
+                             " space in decoded frame buffer pool.";
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+
+    // Copy decoded_image to decoded_frame.
+    libyuv::I420Copy(
+        decoded_image->planes[AOM_PLANE_Y], decoded_image->stride[AOM_PLANE_Y],
+        decoded_image->planes[AOM_PLANE_U], decoded_image->stride[AOM_PLANE_U],
+        decoded_image->planes[AOM_PLANE_V], decoded_image->stride[AOM_PLANE_V],
+        buffer->MutableDataY(), buffer->StrideY(), buffer->MutableDataU(),
+        buffer->StrideU(), buffer->MutableDataV(), buffer->StrideV(),
+        decoded_image->d_w, decoded_image->d_h);
+
+    //static std::fstream f("a.yuv", std::ios::binary | std::ios::out);
+    //f << std::string((char*)buffer->DataY(),
+    //                 buffer->width() * buffer->height() * 3 / 2);
+  }
+  return WEBRTC_VIDEO_CODEC_OK;
 }
 
 // https://aomediacodec.github.io/av1-spec/av1-spec.pdf 5.3.1  Last modified: 2019-01-08 11:48 PT
-nlohmann::json PayloadAV1::open_bitstream_unit(uint64_t sz) {
-  nlohmann::json json;
-  json["obu_header"] = obu_header();
-  uint64_t obu_size{0};
-  if (obu_has_size_field) {
-    obu_size = leb128();
-  } else {
-    obu_size = sz - 1 - obu_extension_flag;
-  }
-  json["obu_size"] = obu_size;
-
-  if (obu_type == OBU_SEQUENCE_HEADER) {
-    json["sequence_header_obu"] = sequence_header_obu();
-  } else if (obu_type == OBU_TEMPORAL_DELIMITER) {
-    //temporal_delimiter_obu();
-  } else if (obu_type == OBU_FRAME_HEADER) {
-    //frame_header_obu();
-  } else if (obu_type == OBU_REDUNDANT_FRAME_HEADER) {
-    //frame_header_obu();
-  } else if (obu_type == OBU_TILE_GROUP) {
-    //tile_group_obu(obu_size);
-  } else if (obu_type == OBU_METADATA) {
-    //metadata_obu();
-  } else if (obu_type == OBU_FRAME) {
-    //frame_obu(obu_size);
-  } else if (obu_type == OBU_TILE_LIST) {
-    //tile_list_obu();
-  } else if (obu_type == OBU_PADDING) {
-    //padding_obu();
-  } else {
-    //reserved_obu();
-  }
-  return json;
+int PayloadAV1::open_bitstream_unit(const uint8_t* buff,
+                                               uint16_t length) {
+  //if (obu_type == OBU_SEQUENCE_HEADER) {
+  //  //json["sequence_header_obu"] = sequence_header_obu();
+  //} else if (obu_type == OBU_TEMPORAL_DELIMITER) {
+  //  //temporal_delimiter_obu();
+  //} else if (obu_type == OBU_FRAME_HEADER) {
+  //  //frame_header_obu();
+  //} else if (obu_type == OBU_REDUNDANT_FRAME_HEADER) {
+  //  //frame_header_obu();
+  //} else if (obu_type == OBU_TILE_GROUP) {
+  //  //tile_group_obu(obu_size);
+  //} else if (obu_type == OBU_METADATA) {
+  //  //metadata_obu();
+  //} else if (obu_type == OBU_FRAME) {
+  //  //frame_obu(obu_size);
+  //} else if (obu_type == OBU_TILE_LIST) {
+  //  //tile_list_obu();
+  //} else if (obu_type == OBU_PADDING) {
+  //  //padding_obu();
+  //} else {
+  //  //reserved_obu();
+  //}
+  return 0;
 }
 
-nlohmann::json PayloadAV1::obu_header() {
-  std::ostringstream oss;
-
-  uint32_t obu_forbidden_bit{0};            // 为0
-  obu_type = 0;                   // 取值范围1-8,15；其他值保留
-  obu_extension_flag = 0;  // 扩展字段
-  obu_has_size_field = 0; // 有obu size字段
-  uint32_t obu_reserved_1bit = 0;  //为0，保留字段
-  buffer_->ReadBits(&obu_forbidden_bit, 1); // f(1)
-  buffer_->ReadBits(&obu_type, 4); // f(4)
-  buffer_->ReadBits(&obu_extension_flag, 1); // f(1)
-  buffer_->ReadBits(&obu_has_size_field, 1); // f(1)
-  buffer_->ReadBits(&obu_reserved_1bit, 1); // f(1)
-
-  oss << obu_type << "(" << obuType2String[(OBU_TYPE)obu_type] << ")";
-  nlohmann::json json = {
-      {"obu_forbidden_bit", obu_forbidden_bit},
-      {"obu_type", oss.str()},
-      {"obu_extension_flag", obu_extension_flag},
-      {"obu_has_size_field", obu_has_size_field},
-      {"obu_reserved_1bit", obu_reserved_1bit},
-  };
-  if (obu_extension_flag == 1) {
-    json["obu_extension_header"] = obu_extension_header();
-  }
-  return json;
-}
-
-nlohmann::json PayloadAV1::obu_extension_header() {
-  uint32_t temporal_id{0};  // 时间层id，默认为0
-  uint32_t spatial_id{0};   // 空间层id，默认为0
-  uint32_t extension_header_reserved_3bits{0};  // 为0，保留字段
-  buffer_->ReadBits(&temporal_id, 3); // f(3)
-  buffer_->ReadBits(&spatial_id, 2);            // f(2)
-  buffer_->ReadBits(&extension_header_reserved_3bits, 3);  // f(3)
-  return {
-      {"temporal_id", temporal_id},
-      {"spatial_id", spatial_id},
-      {"extension_header_reserved_3bits", extension_header_reserved_3bits},
-  };
-}
-
-nlohmann::json PayloadAV1::sequence_header_obu() {
-  uint32_t still_picture{0}; 
-  uint32_t reduced_still_picture_header {0}; 
-  buffer_->ReadBits(&seq_profile, 3); // f(3)
-  buffer_->ReadBits(&still_picture, 1); // f(1)
-  buffer_->ReadBits(&reduced_still_picture_header, 1); // f(1)
-  nlohmann::json json = {
-      {"seq_profile", seq_profile},
-      {"still_picture", still_picture},
-      {"reduced_still_picture_header", reduced_still_picture_header},
-  };
-
-  uint32_t timing_info_present_flag{0};
-  uint32_t decoder_model_info_present_flag{0};
-  uint32_t initial_display_delay_present_flag{0};
-  uint32_t operating_points_cnt_minus_1{0};
-  uint32_t operating_point_idc[128]{0};
-  uint32_t seq_level_idx[128]{0};
-  uint32_t seq_tier[128]{0};
-  uint32_t decoder_model_present_for_this_op[128]{0};
-  uint32_t initial_display_delay_present_for_this_op[128]{0};
-  uint32_t initial_display_delay_minus_1[128]{0};
-
-  if (reduced_still_picture_header) {
-    timing_info_present_flag = 0;
-    decoder_model_info_present_flag = 0;
-    initial_display_delay_present_flag = 0;
-    operating_points_cnt_minus_1 = 0;
-    operating_point_idc[0] = 0;
-    buffer_->ReadBits(&seq_level_idx[0], 5);  // f(5)
-    seq_tier[0] = 0;
-    decoder_model_present_for_this_op[0] = 0;
-    initial_display_delay_present_for_this_op[0] = 0;
-  } else {
-    buffer_->ReadBits(&timing_info_present_flag, 1);  // f(1)
-    json["timing_info_present_flag"] = timing_info_present_flag;
-    if (timing_info_present_flag) {
-      timing_info();
-      buffer_->ReadBits(&decoder_model_info_present_flag, 1);  // f(1)
-      json["decoder_model_info_present_flag"] = decoder_model_info_present_flag;
-      if (decoder_model_info_present_flag) {
-        decoder_model_info();
-      } else {
-        decoder_model_info_present_flag = 0;
-      }
-      buffer_->ReadBits(&initial_display_delay_present_flag, 1);  // f(1)
-      json["initial_display_delay_present_flag"] = initial_display_delay_present_flag;
-      buffer_->ReadBits(&operating_points_cnt_minus_1, 5);  // f(5)
-      json["operating_points_cnt_minus_1"] = operating_points_cnt_minus_1;
-      json["operating_points"] = nlohmann::json::array();
-      for (int i = 0; i <= operating_points_cnt_minus_1; i++) {
-        buffer_->ReadBits(&operating_point_idc[i], 12);  // f(12)
-        buffer_->ReadBits(&seq_level_idx[i], 5);        // f(5)
-        if (seq_level_idx[i] > 7) {
-          buffer_->ReadBits(&seq_tier[i], 1);  // f(1)
-        } else {
-          seq_tier[i] = 0;
-        }
-
-        if (decoder_model_info_present_flag) {
-          buffer_->ReadBits(&decoder_model_present_for_this_op[i], 1);  // f(1)
-          if (decoder_model_present_for_this_op[i]) {
-            operating_parameters_info(i);
-          }
-        } else {
-          decoder_model_present_for_this_op[i] = 0;
-        }
-        if (initial_display_delay_present_flag) {
-          buffer_->ReadBits(&initial_display_delay_present_for_this_op[i], 1);  // f(1)
-          if (initial_display_delay_present_for_this_op[i]) {
-            buffer_->ReadBits(&initial_display_delay_minus_1[i], 4);  // f(4)
-          }
-        }
-        nlohmann::json node = {
-            {"operating_point_idc", operating_point_idc[i]},
-            {"seq_level_idx", seq_level_idx[i]},
-            {"seq_tier", seq_tier[i]},
-            {"decoder_model_present_for_this_op", decoder_model_present_for_this_op[i]},
-            {"initial_display_delay_present_for_this_op", initial_display_delay_present_for_this_op[i]},
-            {"initial_display_delay_minus_1", initial_display_delay_minus_1[i]},
-        };
-        json["operating_points"].push_back(node);
-      }
-    }
-
-    //operatingPoint = choose_operating_point();
-    //OperatingPointIdc = operating_point_idc[operatingPoint];
-
-    uint32_t frame_width_bits_minus_1{0};             
-    uint32_t frame_height_bits_minus_1{0};            
-    buffer_->ReadBits(&frame_width_bits_minus_1, 4);  // f(4)
-    buffer_->ReadBits(&frame_height_bits_minus_1, 4);  // f(4)
-    json["frame_width_bits_minus_1"] = frame_width_bits_minus_1;
-    json["frame_height_bits_minus_1"] = frame_height_bits_minus_1;
-
-    uint32_t max_frame_width_minus_1{0};  // n=frame_width_bits_minus_1 + 1
-    uint32_t max_frame_height_minus_1{0};  // n=frame_height_bits_minus_1 + 1
-    buffer_->ReadBits(&max_frame_width_minus_1, frame_width_bits_minus_1 + 1);  // f(n)
-    buffer_->ReadBits(&max_frame_height_minus_1, frame_height_bits_minus_1 + 1);  // f(n)
-    json["max_frame_width_minus_1"] = max_frame_width_minus_1;
-    json["max_frame_height_minus_1"] = max_frame_height_minus_1;
-
-    uint32_t frame_id_numbers_present_flag{0};
-    if (reduced_still_picture_header) {
-      frame_id_numbers_present_flag = 0;
-    } else {
-      buffer_->ReadBits(&frame_id_numbers_present_flag, 1);  // f(1)
-      json["frame_id_numbers_present_flag"] = frame_id_numbers_present_flag;
-    }
-
-    uint32_t delta_frame_id_length_minus_2{0};
-    uint32_t additional_frame_id_length_minus_1{0};
-    if (frame_id_numbers_present_flag) {
-      buffer_->ReadBits(&delta_frame_id_length_minus_2, 4);  // f(4)
-      buffer_->ReadBits(&additional_frame_id_length_minus_1, 3);  // f(3)
-      json["delta_frame_id_length_minus_2"] = delta_frame_id_length_minus_2;
-      json["additional_frame_id_length_minus_1"] = additional_frame_id_length_minus_1;
-    }
-    uint32_t use_128x128_superblock{0}; 
-    uint32_t enable_filter_intra{0}; 
-    uint32_t enable_intra_edge_filter{0}; 
-    buffer_->ReadBits(&use_128x128_superblock, 1);         // f(1)
-    buffer_->ReadBits(&enable_filter_intra, 1);            // f(1)
-    buffer_->ReadBits(&enable_intra_edge_filter, 1);       // f(1)
-    json["use_128x128_superblock"] = use_128x128_superblock;
-    json["enable_filter_intra"] = enable_filter_intra;
-    json["enable_intra_edge_filter"] = enable_intra_edge_filter;
-
-    uint32_t enable_interintra_compound{0};
-    uint32_t enable_masked_compound{0};
-    uint32_t enable_warped_motion{0};
-    uint32_t enable_dual_filter{0};
-    uint32_t enable_order_hint{0};
-    uint32_t enable_jnt_comp{0};
-    uint32_t enable_ref_frame_mvs{0};
-    uint32_t seq_force_screen_content_tools{0};
-    uint32_t seq_force_integer_mv{0};
-    if (reduced_still_picture_header) {
-      enable_interintra_compound = 0;
-      enable_masked_compound = 0;
-      enable_warped_motion = 0;
-      enable_dual_filter = 0;
-      enable_order_hint = 0;
-      enable_jnt_comp = 0;          
-      enable_ref_frame_mvs = 0;
-      seq_force_screen_content_tools = 2;  // SELECT_SCREEN_CONTENT_TOOLS;
-      seq_force_integer_mv = 2; //SELECT_INTEGER_MV;
-      //OrderHintBits = 0;
-    } else {
-      buffer_->ReadBits(&enable_interintra_compound, 1);  // f(1)
-      buffer_->ReadBits(&enable_masked_compound, 1);      // f(1)
-      buffer_->ReadBits(&enable_warped_motion, 1);        // f(1)
-      buffer_->ReadBits(&enable_dual_filter, 1);          // f(1)
-      buffer_->ReadBits(&enable_order_hint, 1);           // f(1)
-      json["enable_interintra_compound"] = enable_interintra_compound;
-      json["enable_masked_compound"] = enable_masked_compound;
-      json["enable_warped_motion"] = enable_warped_motion;
-      json["enable_dual_filter"] = enable_dual_filter;
-      json["ccccenable_order_hint"] = enable_order_hint;
-      if (enable_order_hint) {
-        buffer_->ReadBits(&enable_jnt_comp, 1);    // f(1)
-        buffer_->ReadBits(&enable_ref_frame_mvs, 1);  // f(1)
-        json["enable_jnt_comp"] = enable_jnt_comp;
-        json["enable_ref_frame_mvs"] = enable_ref_frame_mvs;
-      } else {
-        enable_jnt_comp = 0;
-        enable_ref_frame_mvs = 0;
-      }
-      uint32_t seq_choose_screen_content_tools{0};             
-      buffer_->ReadBits(&seq_choose_screen_content_tools, 1);  // f(1)
-      json["seq_choose_screen_content_tools"] = seq_choose_screen_content_tools;
-      if (seq_choose_screen_content_tools) {
-        seq_force_screen_content_tools = 2; // SELECT_SCREEN_CONTENT_TOOLS;
-      } else {
-        buffer_->ReadBits(&seq_force_screen_content_tools, 1);  // f(1)
-        json["seq_force_screen_content_tools"] = seq_force_screen_content_tools;
-      }
-
-      uint32_t seq_choose_integer_mv{0};
-      if (seq_force_screen_content_tools > 0) {
-        buffer_->ReadBits(&seq_choose_integer_mv, 1);  // f(1)
-        json["seq_choose_integer_mv"] = seq_choose_integer_mv;
-        if (seq_choose_integer_mv) {
-          seq_force_integer_mv = 2;  // SELECT_INTEGER_MV;
-        } else {
-          buffer_->ReadBits(&seq_force_integer_mv, 1);  // f(1)
-          json["seq_force_integer_mv"] = seq_force_integer_mv;
-        }
-      } else {
-        seq_force_integer_mv = 2; // SELECT_INTEGER_MV
-      }
-      uint32_t order_hint_bits_minus_1{0};
-      if (enable_order_hint) {
-        buffer_->ReadBits(&order_hint_bits_minus_1, 3);  // f(3)
-        json["order_hint_bits_minus_1"] = order_hint_bits_minus_1;
-        // OrderHintBits = order_hint_bits_minus_1 + 1;
-      } else {
-        //OrderHintBits = 0;
-      }
-    }
-    uint32_t enable_superres{0};  
-    uint32_t enable_cdef{0};       
-    uint32_t enable_restoration{0};  
-    buffer_->ReadBits(&enable_superres, 1);       // f(1)
-    buffer_->ReadBits(&enable_cdef, 1);        // f(1)
-    buffer_->ReadBits(&enable_restoration, 1);    // f(1)
-    json["enable_superres"] = enable_superres;
-    json["enable_cdef"] = enable_cdef;
-    json["enable_restoration"] = enable_restoration;
-    json["ccccolor_config"] = color_config();
-    uint32_t film_grain_params_present{0};             
-    buffer_->ReadBits(&film_grain_params_present, 1);  // f(1)
-    json["film_grain_params_present"] = film_grain_params_present;
-  }
-  RTC_LOG(LS_INFO) << json.dump();
-  return json;
-}
-
-nlohmann::json PayloadAV1::color_config() {
-  nlohmann::json json;
-  uint32_t high_bitdepth{0};
-  uint32_t twelve_bit{0};
-  uint16_t BitDepth{0};
-
-  buffer_->ReadBits(&high_bitdepth, 1);  // f(1)
-  json["high_bitdepth"] = high_bitdepth;
-  if (seq_profile == 2 && high_bitdepth) {
-    buffer_->ReadBits(&twelve_bit, 1);  // f(1)
-    json["twelve_bit"] = twelve_bit;
-    BitDepth = twelve_bit ? 12 : 10;
-  } else if (seq_profile <= 2) {
-    BitDepth = high_bitdepth ? 10 : 8;
-  }
-  uint32_t mono_chrome{0};
-  if (seq_profile == 1) {
-    mono_chrome = 0;
-  } else {
-    buffer_->ReadBits(&mono_chrome, 1);  // f(1)
-    json["mono_chrome"] = mono_chrome;
-  }
-
-  uint32_t NumPlanes = mono_chrome ? 1 : 3;
-  uint32_t color_description_present_flag{0};
-  buffer_->ReadBits(&color_description_present_flag, 1);  // f(1)
-  json["color_description_present_flag"] = color_description_present_flag;
-  uint32_t color_primaries{0};
-  uint32_t transfer_characteristics{0};
-  uint32_t matrix_coefficients{0};
-  if (color_description_present_flag) {
-    buffer_->ReadBits(&color_primaries, 8);  // f(8)
-    buffer_->ReadBits(&transfer_characteristics, 8);  // f(8)
-    buffer_->ReadBits(&matrix_coefficients, 8);       // f(8)
-    json["color_primaries"] = color_primaries;
-    json["transfer_characteristics"] = transfer_characteristics;
-    json["matrix_coefficients"] = matrix_coefficients;
-  } else {
-    color_primaries = 2; // CP_UNSPECIFIED;
-    transfer_characteristics = 2;  // TC_UNSPECIFIED;
-    matrix_coefficients = 2;       // MC_UNSPECIFIED;
-  }
-
-  uint32_t color_range{0};
-  uint32_t subsampling_x{0};
-  uint32_t subsampling_y{0};
-  uint32_t chroma_sample_position{0};
-  uint32_t separate_uv_delta_q{0};
-  if (mono_chrome) {
-    buffer_->ReadBits(&color_range, 1);  // f(1)
-    json["color_range"] = color_range;
-    subsampling_x = 1;                   
-    subsampling_y = 1;                   
-    chroma_sample_position = 0;          // CSP_UNKNOWN
-    separate_uv_delta_q = 0;             
-    return nlohmann::json();
-  } else if (color_primaries == 1 && // CP_BT_709
-             transfer_characteristics == 13 && // TC_SRGB
-             matrix_coefficients == 0 // MC_IDENTITY
-      ) {
-    color_range = 1;
-    subsampling_x = 0;
-    subsampling_y = 0;
-  } else {
-    buffer_->ReadBits(&color_range, 1);  // f(1)
-    json["color_range"] = color_range;
-    if (seq_profile == 0) {
-      subsampling_x = 1;
-      subsampling_y = 1;
-    } else if (seq_profile == 1) {
-      subsampling_x = 0;
-      subsampling_y = 0;
-    } else {
-      if (BitDepth == 12) {
-        buffer_->ReadBits(&subsampling_x, 1);  // f(1)
-        json["subsampling_x"] = subsampling_x;
-        if (subsampling_x) {
-          buffer_->ReadBits(&subsampling_y, 1);  // f(1)
-          json["subsampling_y"] = subsampling_y;
-        } else {
-          subsampling_y = 0;
-        }
-      } else {
-        subsampling_x = 1;
-        subsampling_y = 0;
-      }
-    }
-    if (subsampling_x && subsampling_y) {
-      buffer_->ReadBits(&chroma_sample_position, 2);  // f(2)
-      json["chroma_sample_position"] = chroma_sample_position;
-    }
-  }
-  buffer_->ReadBits(&separate_uv_delta_q, 1);  // f(1)
-  json["separate_uv_delta_q"] = separate_uv_delta_q;
-
-  return json;
-}
-
-nlohmann::json PayloadAV1::timing_info() {
-  uint32_t num_units_in_display_tick{0};
-  uint32_t time_scale{0};
-  uint32_t equal_picture_interval{0};
-  buffer_->ReadBits(&num_units_in_display_tick, 32);  // f(32)
-  buffer_->ReadBits(&time_scale, 32);                 // f(32)
-  buffer_->ReadBits(&equal_picture_interval, 1);     // f(1)
-
-  nlohmann::json json = {
-      {"num_units_in_display_tick", num_units_in_display_tick},
-      {"time_scale", time_scale},
-      {"equal_picture_interval", equal_picture_interval},
-  };
-  if (equal_picture_interval) {
-    uint32_t num_ticks_per_picture_minus_1 = uvlc();  // uvlc()
-    json["num_ticks_per_picture_minus_1"] = num_ticks_per_picture_minus_1;
-  }
-  return json;
-}
-
-nlohmann::json PayloadAV1::decoder_model_info() {
-  uint32_t num_units_in_decoding_tick{0};
-  uint32_t buffer_removal_time_length_minus_1{0};
-  uint32_t frame_presentation_time_length_minus_1{0};
-  buffer_->ReadBits(&buffer_delay_length_minus_1, 5);  // f(5)
-  buffer_->ReadBits(&num_units_in_decoding_tick, 32);   // f(32)
-  buffer_->ReadBits(&buffer_removal_time_length_minus_1, 5);  // f(5)
-  buffer_->ReadBits(&frame_presentation_time_length_minus_1, 5);  // f(5)
-  return {
-      {"buffer_delay_length_minus_1", buffer_delay_length_minus_1},
-      {"num_units_in_decoding_tick", num_units_in_decoding_tick},
-      {"buffer_removal_time_length_minus_1", buffer_removal_time_length_minus_1},
-      {"frame_presentation_time_length_minus_1", frame_presentation_time_length_minus_1},
-  };
-}
-
-nlohmann::json PayloadAV1::operating_parameters_info(uint16_t op) {
-  uint32_t n = buffer_delay_length_minus_1 + 1;
-  uint32_t decoder_buffer_delay{0};
-  uint32_t encoder_buffer_delay{0};
-  uint32_t low_delay_mode_flag{0};
-  buffer_->ReadBits(&decoder_buffer_delay, n);  // f(n)
-  buffer_->ReadBits(&encoder_buffer_delay, n);  // f(n)
-  buffer_->ReadBits(&low_delay_mode_flag, 1);   // f(1)
-  return {
-      {"decoder_buffer_delay", decoder_buffer_delay},
-      {"encoder_buffer_delay", encoder_buffer_delay},
-      {"low_delay_mode_flag", low_delay_mode_flag},
-  };
-}
-
-uint64_t PayloadAV1::leb128() {
-  uint64_t value{0};
-  for (uint16_t i = 0; i < 8; i++) {
-    uint8_t leb128_byte{0};
-    buffer_->ReadUInt8(&leb128_byte);
-    value |= ((leb128_byte & 0x7f) << (i * 7));
-    if (!(leb128_byte & 0x80)) {
-        break;
-    }
-  }
-  return value;
-}
-
-uint32_t PayloadAV1::uvlc() {
-  uint32_t leadingZeros = 0;
-  while (1) {
-    uint32_t done{0};
-    buffer_->ReadBits(&done, 1);  // f(1)
-    if (done) {
-      break;
-    }
-    ++leadingZeros;
-  }
-  if (leadingZeros >= 32) {
-    return (1ul << 32) - 1;
-  }
-  uint32_t value{0};
-  buffer_->ReadBits(&value, leadingZeros); // f(leadingZeros)
-  return value + (1ul << leadingZeros) - 1;
-}
+//nlohmann::json PayloadAV1::obu_header() {
+//  std::ostringstream oss;
+//
+//  uint32_t obu_forbidden_bit{0};            // 为0
+//  obu_type = 0;                   // 取值范围1-8,15；其他值保留
+//  obu_extension_flag = 0;  // 扩展字段
+//  obu_has_size_field = 0; // 有obu size字段
+//  uint32_t obu_reserved_1bit = 0;  //为0，保留字段
+//  buffer_->ReadBits(&obu_forbidden_bit, 1); // f(1)  保留字段
+//  buffer_->ReadBits(&obu_type, 4); // f(4)
+//  buffer_->ReadBits(&obu_extension_flag, 1); // f(1)
+//  buffer_->ReadBits(&obu_has_size_field, 1); // f(1)
+//  buffer_->ReadBits(&obu_reserved_1bit, 1); // f(1)  保留字段
+//
+//  oss << obu_type << "(" << obuType2String[(OBU_TYPE)obu_type] << ")";
+//  nlohmann::json json = {
+//      {"obu_forbidden_bit", obu_forbidden_bit},
+//      {"obu_type", oss.str()},
+//      {"obu_extension_flag", obu_extension_flag},
+//      {"obu_has_size_field", obu_has_size_field},
+//      {"obu_reserved_1bit", obu_reserved_1bit},
+//  };
+//  if (obu_extension_flag == 1) {
+//    json["obu_extension_header"] = obu_extension_header();
+//  } else {
+//    temporal_id = 0;
+//    spatial_id = 0;
+//  }
+//  return json;
+//}
+//
+//nlohmann::json PayloadAV1::obu_extension_header() {
+//  uint32_t extension_header_reserved_3bits{0};  // 为0，保留字段
+//  buffer_->ReadBits(&temporal_id, 3); // f(3)
+//  buffer_->ReadBits(&spatial_id, 2);            // f(2)
+//  buffer_->ReadBits(&extension_header_reserved_3bits, 3);  // f(3)
+//  return {
+//      {"temporal_id", temporal_id},
+//      {"spatial_id", spatial_id},
+//      {"extension_header_reserved_3bits", extension_header_reserved_3bits},
+//  };
+//}
 
 nlohmann::json PayloadOpus::parse(const uint8_t* buff, uint16_t length) {
   std::ostringstream oss;

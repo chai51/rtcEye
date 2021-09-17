@@ -60,7 +60,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>.;..;../third_party/abseil-cpp;C:\Users\lizhe\2.lib\libmediasoupclient\deps\libsdptransform\include;C:\Users\lizhe\2.lib\openssl-1.1.1i\x64\Debug\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.;..;../third_party/abseil-cpp;../third_party/libyuv/include;C:\Users\lizhe\2.lib\libmediasoupclient\deps\libsdptransform\include;C:\Users\lizhe\2.lib\openssl-1.1.1i\x64\Debug\include;../third_party/libaom/source/config;../third_party/libaom/source/libaom;../third_party/libaom/source/config/win/x64;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WEBRTC_WIN;NOMINMAX;WIN32;_CRT_SECURE_NO_WARNINGS;QT_NO_KEYWORDS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
