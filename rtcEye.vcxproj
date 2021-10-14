@@ -60,11 +60,11 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>.;..;../third_party/abseil-cpp;../third_party/libyuv/include;C:\Users\lizhe\2.lib\libmediasoupclient\deps\libsdptransform\include;C:\Users\lizhe\2.lib\openssl-1.1.1i\x64\Debug\include;../third_party/libaom/source/config;../third_party/libaom/source/libaom;../third_party/libaom/source/config/win/x64;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.;..;../third_party/abseil-cpp;../third_party/libyuv/include;$(LIB_HOME)\libmediasoupclient\deps\libsdptransform\include;$(LIB_HOME)\openssl-1.1.1i\x64\Debug\include;../third_party/libaom/source/config;../third_party/libaom/source/libaom;../third_party/libaom/source/config/win/x64;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WEBRTC_WIN;NOMINMAX;WIN32;_CRT_SECURE_NO_WARNINGS;QT_NO_KEYWORDS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>advapi32.lib;comdlg32.lib;dbghelp.lib;dnsapi.lib;gdi32.lib;msimg32.lib;odbc32.lib;odbccp32.lib;oleaut32.lib;shell32.lib;shlwapi.lib;user32.lib;usp10.lib;uuid.lib;version.lib;wininet.lib;winmm.lib;winspool.lib;ws2_32.lib;delayimp.lib;kernel32.lib;ole32.lib;crypt32.lib;iphlpapi.lib;secur32.lib;dmoguids.lib;wmcodecdspuuid.lib;amstrmid.lib;msdmo.lib;strmiids.lib;webrtc.lib;libssl.lib;libcrypto.lib;sdptransform.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>advapi32.lib;comdlg32.lib;dbghelp.lib;dnsapi.lib;gdi32.lib;msimg32.lib;odbc32.lib;odbccp32.lib;oleaut32.lib;shell32.lib;shlwapi.lib;user32.lib;usp10.lib;uuid.lib;version.lib;wininet.lib;winmm.lib;winspool.lib;ws2_32.lib;delayimp.lib;kernel32.lib;ole32.lib;crypt32.lib;iphlpapi.lib;secur32.lib;dmoguids.lib;wmcodecdspuuid.lib;amstrmid.lib;msdmo.lib;strmiids.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;webrtc.lib;libssl.lib;libcrypto.lib;sdptransform.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>../out/Debug/obj;../out/Debug;../out/Debug/obj/pc;C:\Users\lizhe\2.lib\openssl-1.1.1i\x64\Debug\lib;C:\Users\lizhe\2.lib\libmediasoupclient\build\libsdptransform\Debug;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
@@ -97,6 +97,7 @@
   <ItemGroup>
     <ClCompile Include="chai\PeerConnection.cpp" />
     <ClCompile Include="chai\RtpPakcet.cpp" />
+    <ClCompile Include="chai\ScreenCapturer.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="QmlVideoFrame.cpp" />
     <ClCompile Include="QmlWebSocket.cpp" />
@@ -112,6 +113,7 @@
     <QtMoc Include="QmlVideoFrame.h" />
     <ClInclude Include="chai\PeerConnection.h" />
     <ClInclude Include="chai\RtpPakcet.h" />
+    <ClInclude Include="chai\ScreenCapturer.h" />
     <ClInclude Include="test\test_video_capturer.h" />
     <ClInclude Include="test\vcm_capturer.h" />
   </ItemGroup>

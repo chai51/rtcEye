@@ -9,6 +9,8 @@
 #include <api/video/i420_buffer.h>
 #include <third_party/libyuv/include/libyuv/convert.h>
 
+//#include <third_party/libaom/source/libaom/aom_util/aom_thread.h>
+
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
@@ -1328,10 +1330,23 @@ nlohmann::json PayloadAV1::parse(const uint8_t* buff, uint16_t length) {
   uint16_t num_expected_obus =
       (aggregation_header & 0b0011'0000u) >> 4;  // OBU元素个数
   uint16_t frame_key = (aggregation_header & 0b0000'1000u) >> 3;  // 关键帧
-    
+
+  nlohmann::json obus = {
+      {
+          "aggregation_header",
+          {
+              {"continues_obu", continues_obu},
+              {"expect_continues_obu", expect_continues_obu},
+              {"num_expected_obus", num_expected_obus},
+          },
+      },
+      {"payload_length", length},
+      {"video_codec", "av1"},
+      {"frame_key", frame_key},
+  };
   payloads_.push_back({buff, length});
   if (expect_continues_obu == 1) {
-    return WEBRTC_VIDEO_CODEC_OK;
+    return obus;
   }
 
   webrtc::VideoRtpDepacketizerAv1 depacketizer;
@@ -1416,34 +1431,308 @@ nlohmann::json PayloadAV1::parse(const uint8_t* buff, uint16_t length) {
     //f << std::string((char*)buffer->DataY(),
     //                 buffer->width() * buffer->height() * 3 / 2);
   }
-  return WEBRTC_VIDEO_CODEC_OK;
+
+  obus["obus"] = open_bitstream_unit(bitstream->data(), bitstream->size());
+
+  return obus;
 }
 
 // https://aomediacodec.github.io/av1-spec/av1-spec.pdf 5.3.1  Last modified: 2019-01-08 11:48 PT
-int PayloadAV1::open_bitstream_unit(const uint8_t* buff,
+nlohmann::json PayloadAV1::open_bitstream_unit(const uint8_t* buff,
                                                uint16_t length) {
-  //if (obu_type == OBU_SEQUENCE_HEADER) {
-  //  //json["sequence_header_obu"] = sequence_header_obu();
-  //} else if (obu_type == OBU_TEMPORAL_DELIMITER) {
-  //  //temporal_delimiter_obu();
-  //} else if (obu_type == OBU_FRAME_HEADER) {
-  //  //frame_header_obu();
-  //} else if (obu_type == OBU_REDUNDANT_FRAME_HEADER) {
-  //  //frame_header_obu();
-  //} else if (obu_type == OBU_TILE_GROUP) {
-  //  //tile_group_obu(obu_size);
-  //} else if (obu_type == OBU_METADATA) {
-  //  //metadata_obu();
-  //} else if (obu_type == OBU_FRAME) {
-  //  //frame_obu(obu_size);
-  //} else if (obu_type == OBU_TILE_LIST) {
-  //  //tile_list_obu();
-  //} else if (obu_type == OBU_PADDING) {
-  //  //padding_obu();
-  //} else {
-  //  //reserved_obu();
-  //}
-  return 0;
+  nlohmann::json obus = nlohmann::json::array();
+  uint16_t offset{0};
+  while (offset < length) {
+    uint8_t obu_header = buff[offset];
+    uint16_t type = (obu_header & 0b0111'1000) >> 3;
+    uint16_t has_extension = (obu_header & 0b0000'0100) >> 2;
+    uint16_t has_size_field = (obu_header & 0b0000'0010) >> 1;
+    uint16_t temporal_layer_id{0};
+    uint16_t spatial_layer_id{0};
+    offset += 1;
+    if (has_extension) {
+      uint8_t extension_header = buff[offset];
+      temporal_layer_id = (obu_header & 0b1110'0000) >> 5;
+      spatial_layer_id = (obu_header & 0b0001'1000) >> 3;
+      offset += 1;
+    }
+    if (has_size_field) {
+      uint64_t length_field_size_payload{0};
+      offset += leb128(buff + offset, length_field_size_payload);
+      offset += length_field_size_payload;
+    } else {
+      offset = length;
+    }
+    nlohmann::json obu = {{"obu_header",
+                            {{"type", type},
+                             {"has_extension", has_extension},
+                             {"has_size_field", has_size_field},
+                             {"temporal_layer_id", temporal_layer_id},
+                             {"spatial_layer_id", spatial_layer_id}}}};
+
+    uint16_t size6 = sizeof(void*);
+
+    auto* ctx = (aom_codec_alg_priv_t*)context_->priv;
+    if (type == OBU_SEQUENCE_HEADER) {
+      obus.push_back(obu_sequence_header());
+    } else if (type == OBU_TEMPORAL_DELIMITER) {
+      obus.push_back(obu_temporal_delimiter());
+    } else if (type == OBU_FRAME_HEADER) {
+      obus.push_back(obu_frame());
+    } else if (type == OBU_REDUNDANT_FRAME_HEADER) {
+      obus.push_back(obu_frame());
+    } else if (type == OBU_TILE_GROUP) {
+      obus.push_back(obu_tile_group());
+    } else if (type == OBU_METADATA) {
+      obus.push_back(obu_metadata());
+    } else if (type == OBU_FRAME) {
+      obus.push_back(obu_frame());
+    } else if (type == OBU_TILE_LIST) {
+      obus.push_back(obu_tile_list());
+    } else if (type == OBU_PADDING) {
+      obus.push_back(obu_padding());
+    } else {
+    }
+  }
+  return obus;
+
+/*
+  obu_header
+    obu_forbidden_bit 必须设置为0
+    obu_type 指定了OBU负载中包含的数据结构类型
+
+*/
+}
+
+uint32_t PayloadAV1::leb128(const uint8_t* buff, uint64_t& value) {
+  value = 0;
+  uint16_t i{0};
+  for (i = 0; i < 8; i++) {
+    uint8_t leb128_byte = buff[i];
+    value |= ((leb128_byte & 0x7f) << (i * 7));
+    if (!(leb128_byte & 0x80)) {
+      break;
+    }
+  }
+  return i + 1;
+}
+
+nlohmann::json PayloadAV1::obu_sequence_header() {
+  auto* ctx = (aom_codec_alg_priv_t*)context_->priv;
+  AVxWorker* worker = get_worker(ctx);
+  FrameWorkerData* const frame_worker_data = (FrameWorkerData*)worker->data1;
+  AV1Decoder* pbi = frame_worker_data->pbi;
+
+  SequenceHeader* const seq_params = pbi->common.seq_params;
+
+  nlohmann::json obu = {
+      {"obu_type", "obu_sequence_header"},
+      {"size", pbi->obu_size_hdr.size},
+      {"seq_profile", seq_params->profile},
+      {"still_picture", seq_params->still_picture},
+      {"reduced_still_picture_header", seq_params->reduced_still_picture_hdr},
+      {"timing_info_present_flag", seq_params->timing_info_present},
+      {"decoder_model_info_present_flag", seq_params->decoder_model_info_present_flag},
+      {"initial_display_delay_present_flag", seq_params->display_model_info_present_flag},
+      {"operating_points_cnt_minus_1", seq_params->operating_points_cnt_minus_1},
+      {"operating_points", nlohmann::json::array()},
+      {"frame_width_bits", seq_params->num_bits_width},
+      {"frame_height_bits", seq_params->num_bits_height},
+      {"max_frame_width", seq_params->max_frame_width},
+      {"max_frame_height", seq_params->max_frame_height},
+      {"frame_id_numbers_present_flag", seq_params->frame_id_numbers_present_flag},
+      {"delta_frame_id_length", seq_params->delta_frame_id_length},
+      {"additional_frame_id_length", seq_params->frame_id_length - seq_params->delta_frame_id_length},
+      {"use_128x128_superblock", seq_params->sb_size},  // 15:128 12:64
+      {"enable_filter_intra", seq_params->enable_filter_intra},
+      {"enable_intra_edge_filter", seq_params->enable_intra_edge_filter},
+      {"enable_interintra_compound", seq_params->enable_interintra_compound},
+      {"enable_masked_compound", seq_params->enable_masked_compound},
+      {"enable_warped_motion", seq_params->enable_warped_motion},
+      {"enable_dual_filter", seq_params->enable_dual_filter},
+      {"enable_order_hint", seq_params->order_hint_info.enable_order_hint},
+      {"enable_jnt_comp", seq_params->order_hint_info.enable_dist_wtd_comp},
+      {"enable_ref_frame_mvs", seq_params->order_hint_info.enable_ref_frame_mvs},
+      {"seq_force_screen_content_tools", seq_params->force_screen_content_tools},
+      {"seq_force_integer_mv", seq_params->force_integer_mv},
+      {"order_hint_bits_minus_1", seq_params->order_hint_info.order_hint_bits_minus_1},
+      {"enable_superres", seq_params->enable_superres},
+      {"enable_cdef", seq_params->enable_cdef},
+      {"enable_restoration", seq_params->enable_restoration},
+      {"film_grain_params_present", seq_params->film_grain_params_present},
+      {"spatial_layers", pbi->number_spatial_layers},
+      {"temporal_layers", pbi->number_temporal_layers},
+
+      {"bitdepth", seq_params->bit_depth},
+      {"mono_chrome", seq_params->monochrome},
+      {"color_primaries", seq_params->color_primaries},
+      {"transfer_characteristics", seq_params->transfer_characteristics},
+      {"matrix_coefficients", seq_params->matrix_coefficients},
+      {"color_range", seq_params->color_range},
+      {"subsampling_x", seq_params->subsampling_x},
+      {"subsampling_y", seq_params->subsampling_y},
+      {"chroma_sample_position", seq_params->chroma_sample_position},
+      {"separate_uv_delta_q", seq_params->separate_uv_delta_q},
+  };
+  if (seq_params->timing_info_present) {
+    aom_timing_info_t* timing_info = &seq_params->timing_info;
+    obu["timing_info"] = {
+        {"num_units_in_display_tick", timing_info->num_units_in_display_tick},
+        {"time_scale", timing_info->time_scale},
+        {"equal_picture_interval", timing_info->equal_picture_interval},
+        {"num_ticks_per_picture", timing_info->num_ticks_per_picture},
+    };
+  }
+  if (seq_params->decoder_model_info_present_flag) {
+    aom_dec_model_info_t* decoder_model_info = &seq_params->decoder_model_info;
+    obu["decoder_model_info"] = {
+        {"buffer_delay_length",
+         decoder_model_info->encoder_decoder_buffer_delay_length},
+        {"num_units_in_decoding_tick",
+         decoder_model_info->num_units_in_decoding_tick},
+        {"buffer_removal_time_length",
+         decoder_model_info->buffer_removal_time_length},
+        {"frame_presentation_time_length",
+         decoder_model_info->frame_presentation_time_length},
+    };
+    for (int i = 0; i <= seq_params->operating_points_cnt_minus_1; i++) {
+      obu["operating_points"].push_back({
+          {"operating_point_idc", seq_params->operating_point_idc[i]},
+          {"seq_level_idx", seq_params->seq_level_idx[i]},
+          {"seq_tier", seq_params->tier[i]},
+          {"decoder_model_present_for_this_op",
+           seq_params->op_params[i].decoder_model_param_present_flag},
+          {"initial_display_delay_present_for_this_op",
+           seq_params->op_params[i].display_model_param_present_flag},
+          {"initial_display_delay",
+           seq_params->op_params[i].initial_display_delay},
+      });
+      if (seq_params->op_params[i].decoder_model_param_present_flag) {
+        aom_dec_model_op_parameters_t* op_params = &seq_params->op_params[i];
+        obu["operating_points"]["decoder_buffer_delay"] =
+            op_params->decoder_buffer_delay;
+        obu["operating_points"]["encoder_buffer_delay"] =
+            op_params->encoder_buffer_delay;
+        obu["operating_points"]["low_delay_mode_flag"] =
+            op_params->low_delay_mode_flag;
+      }
+    }
+  }
+  return obu;
+}
+
+nlohmann::json PayloadAV1::obu_temporal_delimiter() {
+  return {
+      {"obu_type", "obu_temporal_delimiter"},
+  };
+}
+
+nlohmann::json PayloadAV1::obu_frame_header() {
+  return {
+      {"obu_type", "obu_frame_header"},
+  };
+}
+
+nlohmann::json PayloadAV1::obu_redundant_frame_header() {
+  return {
+      {"obu_type", "obu_redundant_frame_header"},
+  };
+}
+
+nlohmann::json PayloadAV1::obu_tile_group() {
+  return {
+      {"obu_type", "obu_tile_group"},
+  };
+}
+
+nlohmann::json PayloadAV1::obu_metadata() {
+  return {
+      {"obu_type", "obu_metadata"},
+  };
+}
+
+nlohmann::json PayloadAV1::obu_frame() {
+  auto* ctx = (aom_codec_alg_priv_t*)context_->priv;
+  AVxWorker* worker = get_worker(ctx);
+  FrameWorkerData* const frame_worker_data = (FrameWorkerData*)worker->data1;
+  AV1Decoder* pbi = frame_worker_data->pbi;
+  AV1_COMMON* const cm = &pbi->common;
+  const SequenceHeader* const seq_params = cm->seq_params;
+  CurrentFrame* const current_frame = &cm->current_frame;
+  FeatureFlags* const features = &cm->features;
+  MACROBLOCKD* const xd = &pbi->dcb.xd;
+  BufferPool* const pool = cm->buffer_pool;
+  RefCntBuffer* const frame_bufs = pool->frame_bufs;
+  aom_s_frame_info* sframe_info = &pbi->sframe_info;
+
+  if (seq_params->reduced_still_picture_hdr) {
+    return nlohmann::json();
+  }
+
+  nlohmann::json obu = {
+      {"obu_type", "obu_frame"},
+      {"show_existing_frame", cm->show_existing_frame},
+      {"frame_presentation_time", cm->frame_presentation_time},
+      {"frame_type", current_frame->frame_type},
+      {"show_frame", cm->show_frame},
+      {"showable_frame", cm->showable_frame},
+      {"error_resilient_mode", features->error_resilient_mode},
+      {"disable_cdf_update", features->disable_cdf_update},
+      {"allow_screen_content_tools", features->allow_screen_content_tools},
+      {"force_integer_mv", features->cur_frame_force_integer_mv},
+      {"current_frame_id", cm->current_frame_id},
+      {"order_hint", current_frame->order_hint},
+      {"primary_ref_frame", features->primary_ref_frame},
+      {"buffer_removal_time_present_flag", pbi->buffer_removal_time_present},
+      {"buffer_removal_time", nlohmann::json::array()},
+      {"refresh_frame_flags", current_frame->refresh_frame_flags},  // 15:128 12:64
+      {"ref_order_hint", nlohmann::json::array()},
+      {"allow_intrabc", features->allow_intrabc},
+      {"frame_refs_short_signaling", seq_params->enable_interintra_compound},
+      {"ref_frame_idx", nlohmann::json::array()},
+      {"allow_high_precision_mv", features->allow_high_precision_mv},
+      {"interp_filter", features->interp_filter},
+      {"is_motion_mode_switchable", features->switchable_motion_mode},
+      {"use_ref_frame_mvs", features->allow_ref_frame_mvs},
+      {"refresh_frame_context", features->refresh_frame_context},
+      {"allow_warped_motion", features->allow_warped_motion},
+      {"reduced_tx_set", features->reduced_tx_set_used},
+  };
+  if (pbi->buffer_removal_time_present) {
+    for (int op_num = 0; op_num < seq_params->operating_points_cnt_minus_1 + 1; op_num++) {
+      obu["buffer_removal_time"].push_back(cm->buffer_removal_times[op_num]);
+    }
+  }
+  if (!(cm->current_frame.frame_type == KEY_FRAME ||
+        cm->current_frame.frame_type == INTRA_ONLY_FRAME) ||
+      current_frame->refresh_frame_flags != 0xFF) {
+    if (features->error_resilient_mode &&
+        seq_params->order_hint_info.enable_order_hint) {
+      for (int ref_idx = 0; ref_idx < REF_FRAMES; ref_idx++) {
+        obu["ref_order_hint"].push_back(cm->ref_frame_map[ref_idx]->order_hint);
+      }
+    }
+  }
+  for (int i = 0; i < INTER_REFS_PER_FRAME; ++i) {
+    obu["ref_frame_idx"].push_back(cm->remapped_ref_idx[i]);
+  }
+
+  if (seq_params->decoder_model_info_present_flag &&
+      seq_params->timing_info.equal_picture_interval == 0) {
+  }
+  return obu;
+}
+
+nlohmann::json PayloadAV1::obu_tile_list() {
+  return {
+      {"obu_type", "obu_tile_list"},
+  };
+}
+
+nlohmann::json PayloadAV1::obu_padding() {
+  return {
+      {"obu_type", "obu_padding"},
+  };
 }
 
 //nlohmann::json PayloadAV1::obu_header() {

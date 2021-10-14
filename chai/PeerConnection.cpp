@@ -41,12 +41,13 @@
 #include <sdptransform.hpp>
 
 #include "test/vcm_capturer.h"
+#include "ScreenCapturer.h"
 
 using json = nlohmann::json;
 
 const std::string videoMid = "1";
-const size_t kWidth{640};
-const size_t kHeight{480};
+const size_t kWidth{1920};
+const size_t kHeight{1080};
 const size_t kFps{30};
 
 const char kAudioLabel[] = "audio_label";
@@ -58,29 +59,34 @@ const char* kFlexFecEnabledFieldTrials =
 namespace {
 class CapturerTrackSource : public webrtc::VideoTrackSource {
  public:
-  static rtc::scoped_refptr<CapturerTrackSource> Create() {
-    std::unique_ptr<webrtc::test::VcmCapturer> capturer;
-    std::unique_ptr<webrtc::VideoCaptureModule::DeviceInfo> info(
-        webrtc::VideoCaptureFactory::CreateDeviceInfo());
-    if (!info) {
-      return nullptr;
-    }
-    DeviceList(info.get());
+  static rtc::scoped_refptr<CapturerTrackSource> Create(bool screen = false) {
+    if (screen) {
+      std::unique_ptr<chai::ScreenCapturer> capturer(
+          chai::ScreenCapturer::Create(kWidth, kHeight, kFps));
+      if (capturer) {
+        return new rtc::RefCountedObject<CapturerTrackSource>(
+            std::move(capturer));
+      }
+    } else {
+      DeviceList();
 
-    int num_devices = info->NumberOfDevices();
-    for (int i = 0; i < num_devices; ++i) {
-      capturer = absl::WrapUnique(
-          webrtc::test::VcmCapturer::Create(kWidth, kHeight, kFps, i));
+      std::unique_ptr<webrtc::test::VcmCapturer> capturer(
+          webrtc::test::VcmCapturer::Create(kWidth, kHeight, kFps, 0));
       if (capturer) {
         return new rtc::RefCountedObject<CapturerTrackSource>(
             std::move(capturer));
       }
     }
-
     return nullptr;
   }
 
-  static void DeviceList(webrtc::VideoCaptureModule::DeviceInfo* device_info) {
+  static void DeviceList() {
+    std::unique_ptr<webrtc::VideoCaptureModule::DeviceInfo> device_info(
+        webrtc::VideoCaptureFactory::CreateDeviceInfo());
+    if (!device_info) {
+      return;
+    }
+
     for (int i = 0; i < device_info->NumberOfDevices(); ++i) {
       char device_name[256];
       char unique_name[256];
@@ -100,12 +106,19 @@ class CapturerTrackSource : public webrtc::VideoTrackSource {
   explicit CapturerTrackSource(
       std::unique_ptr<webrtc::test::VcmCapturer> capturer)
       : VideoTrackSource(/*remote=*/false), capturer_(std::move(capturer)) {}
-
+  explicit CapturerTrackSource(std::unique_ptr<chai::ScreenCapturer> screen)
+      : VideoTrackSource(/*remote=*/false),
+        screenCapturer_(std::move(screen)) {}
  private:
   rtc::VideoSourceInterface<webrtc::VideoFrame>* source() override {
-    return this->capturer_.get();
+    if (this->capturer_) {
+      return this->capturer_.get();
+    } else {
+      return this->screenCapturer_.get();
+    }
   }
   std::unique_ptr<webrtc::test::VcmCapturer> capturer_{nullptr};
+  std::unique_ptr<chai::ScreenCapturer> screenCapturer_{nullptr};
 };
 }  // namespace
 
@@ -463,37 +476,16 @@ void PeerConnection::CreateTrack(const cricket::AudioOptions& audio,
 
   {
     rtc::scoped_refptr<CapturerTrackSource> video_device =
-        CapturerTrackSource::Create();
+        CapturerTrackSource::Create(false);
     if (video_device) {
       rtc::scoped_refptr<webrtc::VideoTrackInterface> video_track_(
           peerConnectionFactory->CreateVideoTrack(kVideoLabel, video_device));
 
-      const char* rids[] = {"low", "medium", "high"};
-      const char* msid[] = {"l", "m", "h"};
-      // auto result_or_error = this->pc->AddTrack(video_track_, { kStreamId });
-
-      bool svc = true;
       webrtc::RtpTransceiverInit init;
       init.direction = webrtc::RtpTransceiverDirection::kSendOnly;
-      // if (svc)
-      //{
-      //	for (int i = 2; i >= 0; --i)
-      //	{
-      //		webrtc::RtpEncodingParameters encoding;
-      //		encoding.active = true;
-      //		encoding.rid = rids[i];
-      //		encoding.num_temporal_layers = 3;
-      //		init.stream_ids.push_back(msid[i]);
-      //		init.send_encodings.push_back(encoding);
-      //	}
-      //}
-      // else
       {
-        int index = 2;
         init.direction = webrtc::RtpTransceiverDirection::kSendOnly;
         webrtc::RtpEncodingParameters encoding;
-        encoding.active = true;
-        // encoding.rid = rids[index];
         encoding.num_temporal_layers = 3;
         init.stream_ids.push_back(kStreamId);
         init.send_encodings.push_back(encoding);

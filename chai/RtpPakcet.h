@@ -67,9 +67,18 @@ class PayloadAV1 : public PayloadBase {
   nlohmann::json parse(const uint8_t* buff, uint16_t length) override;
 
  protected:
-  int open_bitstream_unit(const uint8_t* buff, uint16_t length);
-
+  nlohmann::json open_bitstream_unit(const uint8_t* buff, uint16_t length);
+  uint32_t leb128(const uint8_t* buff, uint64_t& value);
  protected:
+  nlohmann::json obu_sequence_header();
+  nlohmann::json obu_temporal_delimiter();
+  nlohmann::json obu_frame_header();
+  nlohmann::json obu_redundant_frame_header();
+  nlohmann::json obu_tile_group();
+  nlohmann::json obu_metadata();
+  nlohmann::json obu_frame();
+  nlohmann::json obu_tile_list();
+  nlohmann::json obu_padding();
 
  private:
   std::unique_ptr<aom_codec_ctx_t> context_;

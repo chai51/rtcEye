@@ -44,6 +44,9 @@
     <ClCompile Include="chai\RtpPakcet.cpp">
       <Filter>chai</Filter>
     </ClCompile>
+    <ClCompile Include="chai\ScreenCapturer.cpp">
+      <Filter>chai</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="test\test_video_capturer.h">
@@ -56,6 +59,9 @@
       <Filter>chai</Filter>
     </ClInclude>
     <ClInclude Include="chai\RtpPakcet.h">
+      <Filter>chai</Filter>
+    </ClInclude>
+    <ClInclude Include="chai\ScreenCapturer.h">
       <Filter>chai</Filter>
     </ClInclude>
   </ItemGroup>

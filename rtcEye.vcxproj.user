@@ -4,4 +4,7 @@
     <LocalDebuggerEnvironment>path=C:\Qt\Tools\OpenSSL\Win_x64\bin;C:\Users\chai\2.lib\msvc\bin\x64;$(QtDllPath)</LocalDebuggerEnvironment>
     <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
   </PropertyGroup>
+  <PropertyGroup Label="QtSettings" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <QtLastBackgroundBuild>2021-10-14T12:41:31.3707624Z</QtLastBackgroundBuild>
+  </PropertyGroup>
 </Project>

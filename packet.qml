@@ -82,12 +82,16 @@ Rectangle {
                         view.currentIndex = index;
                         packet.forceActiveFocus()
                     }
+
+                    onDoubleClicked: {
+                        pop.open();
+                        edit.text = JSON.stringify(JSON.parse(baseText), null, 2);
+                    }
                 }
                 onActiveFocusChanged: {
                     if (activeFocus) {
                         startGradient.color = "#00BFFF";
                         endGradient.color = "#00BFFF";
-                        edit.text = JSON.stringify(JSON.parse(baseText), null, 2);
                     } else {
                         startGradient.color = startColor;
                         endGradient.color = endColor;
@@ -97,34 +101,36 @@ Rectangle {
         }
     }
 
-    Flickable {
-         id: flick
+    Popup {
+        id: pop
+        width: control.width / 2
+        height: control.height
+        anchors.centerIn: control
+        Flickable {
+             id: flick
+             anchors.fill: parent
+             contentWidth: edit.paintedWidth
+             contentHeight: edit.paintedHeight
+             clip: true
 
-         width: childWidth
-         height: childHeight;
-         contentWidth: edit.paintedWidth
-         contentHeight: edit.paintedHeight
-         anchors.top: control.bottom
-         anchors.right: control.right
-         clip: true
+             function ensureVisible(r) {
+                 if (contentX >= r.x)
+                     contentX = r.x;
+                 else if (contentX+width <= r.x+r.width)
+                     contentX = r.x+r.width-width;
+                 if (contentY >= r.y)
+                     contentY = r.y;
+                 else if (contentY+height <= r.y+r.height)
+                     contentY = r.y+r.height-height;
+             }
 
-         function ensureVisible(r) {
-             if (contentX >= r.x)
-                 contentX = r.x;
-             else if (contentX+width <= r.x+r.width)
-                 contentX = r.x+r.width-width;
-             if (contentY >= r.y)
-                 contentY = r.y;
-             else if (contentY+height <= r.y+r.height)
-                 contentY = r.y+r.height-height;
+             TextEdit {
+                 id: edit
+                 width: flick.width
+                 focus: true
+                 wrapMode: TextEdit.Wrap
+                 onCursorRectangleChanged: flick.ensureVisible(cursorRectangle)
+             }
          }
-
-         TextEdit {
-             id: edit
-             width: flick.width
-             focus: true
-             wrapMode: TextEdit.Wrap
-             onCursorRectangleChanged: flick.ensureVisible(cursorRectangle)
-         }
-     }
+    }
 }

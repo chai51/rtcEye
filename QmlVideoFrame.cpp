@@ -108,12 +108,11 @@ void QmlVideoFrame::OnFrame(const webrtc::VideoFrame& video_frame) {
     buffer = webrtc::I420Buffer::Rotate(*buffer, video_frame.rotation());
   }
 
-  int width = buffer->width();
-  int height = buffer->height();
-  int size = width * height * 3 / 2;
+  buffer = buffer->Scale(this->_width, this->_height)->ToI420();
 
+  int size = _width * _height * 3 / 2;
   {
-    QVideoFrame frame(size, QSize(width, height), width, this->_format.pixelFormat());
+    QVideoFrame frame(size, QSize(_width, _height), _width, this->_format.pixelFormat());
     if (frame.map(QAbstractVideoBuffer::WriteOnly)) {
       memcpy(frame.bits(), buffer->DataY(), size);
       frame.setStartTime(0);
