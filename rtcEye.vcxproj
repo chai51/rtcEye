@@ -95,6 +95,8 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="chai\PayloadAV1.cpp" />
+    <ClCompile Include="chai\PayloadH264.cpp" />
     <ClCompile Include="chai\PeerConnection.cpp" />
     <ClCompile Include="chai\RtpPakcet.cpp" />
     <ClCompile Include="chai\ScreenCapturer.cpp" />
@@ -111,6 +113,8 @@
   <ItemGroup>
     <QtMoc Include="QmlWebSocket.h" />
     <QtMoc Include="QmlVideoFrame.h" />
+    <ClInclude Include="chai\PayloadAV1.h" />
+    <ClInclude Include="chai\PayloadH264.h" />
     <ClInclude Include="chai\PeerConnection.h" />
     <ClInclude Include="chai\RtpPakcet.h" />
     <ClInclude Include="chai\ScreenCapturer.h" />

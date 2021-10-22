@@ -3,7 +3,6 @@
 #include <iostream>
 
 #include <api/video/i420_buffer.h>
-#include <sdptransform.hpp>
 
 QmlVideoFrame::QmlVideoFrame(QObject* parent /*= Q_NULLPTR*/) {
   chai::PeerConnection::Initialize();
@@ -123,36 +122,12 @@ void QmlVideoFrame::OnFrame(const webrtc::VideoFrame& video_frame) {
 }
 
 void QmlVideoFrame::onRtpPakcet(nlohmann::json& json) {
-  auto j = json.dump();
-  uint8_t payloadType = json["header"]["payload_type"].get<uint8_t>();
+  //auto j = json.dump();
 
-  nlohmann::json customize;
-
-  switch (payloadType) {
-    case chai::Subtype::OPUS:
-      customize["subtype"] = "audio";
-      break;
-    case chai::Subtype::H264:
-    case chai::Subtype::AV1:
-      customize["subtype"] = "video";
-      break;
-    case chai::Subtype::H264_RTX:
-    case chai::Subtype::AV1_RTX:
-      customize["subtype"] = "rtx";
-      break;
-    case chai::Subtype::FLEXFEC:
-      customize["subtype"] = "fec";
-      break;
-    default:
-      break;
+  if (json["payload"].is_null()) {
+    //RTC_LOG(LS_VERBOSE) << "payload is null";
+    return;
   }
-
-  if (json["payload"].is_object() &&
-      json["payload"]["frame_key"].get<uint8_t>() == 1) {
-    customize["keyframe"] = true;
-  }
-
-  json["customize"] = customize;
   Q_EMIT this->message("rtp", QString::fromStdString(json.dump()));
 }
 

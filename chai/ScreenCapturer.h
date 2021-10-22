@@ -3,7 +3,6 @@
 
 #include <api/video/video_frame.h>
 #include <api/video/video_source_interface.h>
-#include <media/base/video_adapter.h>
 #include <media/base/video_broadcaster.h>
 #include <api/video/i420_buffer.h>
 #include <rtc_base/task_queue.h>

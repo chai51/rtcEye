@@ -59,7 +59,7 @@ const char* kFlexFecEnabledFieldTrials =
 namespace {
 class CapturerTrackSource : public webrtc::VideoTrackSource {
  public:
-  static rtc::scoped_refptr<CapturerTrackSource> Create(bool screen = false) {
+  static rtc::scoped_refptr<CapturerTrackSource> Create(bool screen) {
     if (screen) {
       std::unique_ptr<chai::ScreenCapturer> capturer(
           chai::ScreenCapturer::Create(kWidth, kHeight, kFps));
@@ -838,34 +838,32 @@ void PeerConnection::RtpTransport::parseRtpPacket(
   }
 
   parseQueue->PostTask([this, buff = std::move(buff), len]() {
-    //uint8_t payloadType = buff.get()[1] & 0x7f;
-    ////// frame buffer
-    //// append_packet(&frameBuffer, buff.get(), len, nullptr);
+    uint8_t payloadType = buff.get()[1] & 0x7f;
 
-    //// parse payload
-    //nlohmann::json json;
-    //switch (payloadType) {
-    //  case Subtype::OPUS:  // opus
-    //  case Subtype::H264:  // h264
-    //  case Subtype::AV1:
-    //  case Subtype::FLEXFEC: {
-    //    json = this->rtpPacket.parse(buff.get(), len);
-    //    break;
-    //  } 
-    //  case Subtype::H264_RTX:  // rtx
-    //  case Subtype::AV1_RTX: {
-    //    RtxPacket rtx;
-    //    json = rtx.parse(buff.get(), len);
-    //    break;
-    //  } 
-    //  case Subtype::TEST: {
-    //    return;
-    //  }
-    //  default: {
-    //    return;
-    //  }
-    //}
-    //this->observer->onRtpPakcet(json);
+    // parse payload
+    nlohmann::json json;
+    switch (payloadType) {
+      case Subtype::OPUS:  // opus
+      case Subtype::H264:  // h264
+      case Subtype::AV1:
+      case Subtype::FLEXFEC: {
+        json = this->rtpPacket.parse(buff.get(), len);
+        break;
+      } 
+      case Subtype::H264_RTX:  // rtx
+      case Subtype::AV1_RTX: {
+        RtxPacket rtx;
+        json = rtx.parse(buff.get(), len);
+        break;
+      } 
+      case Subtype::TEST: {
+        return;
+      }
+      default: {
+        return;
+      }
+    }
+    this->observer->onRtpPakcet(json);
   });
 }
 

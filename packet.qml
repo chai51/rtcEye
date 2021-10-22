@@ -13,29 +13,7 @@ Rectangle {
 
     function addRtp(msg) {
         const message = JSON.parse(msg);
-        switch (message.customize.subtype) {
-        case "audio":
-            modPacket.append({info: JSON.stringify(message.header), details: msg, color1: "#E6E6FA", color2: "#E6E6FA"});
-            break;
-        case "video":
-            if (message.customize.keyframe) {
-                modPacket.append({info: JSON.stringify(message.header), details: msg, color1: "#FFFFFF", color2: "#FF0000"});
-            } else {
-                modPacket.append({info: JSON.stringify(message.header), details: msg, color1: "#FFFFFF", color2: "#FFFFFF"});
-            }
-            break;
-        case "rtx":
-            if (message.customize.keyframe) {
-                modPacket.append({info: JSON.stringify(message.header), details: msg, color1: "#808080", color2: "#FFFFFF"});
-            } else {
-                modPacket.append({info: JSON.stringify(message.header), details: msg, color1: "#808080", color2: "#808080"});
-            }
-            break;
-        case "fec":
-            modPacket.append({info: JSON.stringify(message.header), details: msg, color1: "#E1FFFF", color2: "#E1FFFF"});
-            break;
-        }
-
+        modPacket.append({info: JSON.stringify(message.header), details: msg, color1: message.customize.color1, color2: message.customize.color2});
     }
 
 

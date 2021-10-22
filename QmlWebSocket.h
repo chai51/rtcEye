@@ -4,7 +4,6 @@
  */
 #pragma once
 #include <QtWebSockets/QWebSocket>
-#include <future>
 
 QT_FORWARD_DECLARE_CLASS(QSslPreSharedKeyAuthenticator)
 

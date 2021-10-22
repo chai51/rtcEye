@@ -3,12 +3,12 @@
 #include "RtpPakcet.h"
 
 #include <api/audio_codecs/opus/audio_decoder_opus.h>
-#include <common_video/h264/h264_common.h>
 #include <modules/rtp_rtcp/source/byte_io.h>
+#include <modules/rtp_rtcp/source/create_video_rtp_depacketizer.h>
 #include <modules/rtp_rtcp/source/video_rtp_depacketizer_av1.h>
+#include <modules/video_coding/frame_object.h>
 #include <api/video/i420_buffer.h>
 #include <third_party/libyuv/include/libyuv/convert.h>
-
 //#include <third_party/libaom/source/libaom/aom_util/aom_thread.h>
 
 #include <algorithm>
@@ -17,6 +17,8 @@
 #include <memory>  // std::unique_ptr
 #include <sdptransform.hpp>
 
+#include "PayloadAV1.h"
+
 using json = nlohmann::json;
 
 namespace {
@@ -24,102 +26,6 @@ const uint16_t kFixedHeaderSize{12};
 const uint16_t kOneByteExtensionProfileId{0xBEDE};
 const uint16_t kTwoByteExtensionProfileId{0x1000};
 
-const uint16_t kNalHeaderSize{1};
-const uint16_t kLengthFieldSize{2};
-const uint16_t kStapAHeaderSize = kNalHeaderSize + kLengthFieldSize;
-// Bit masks for FU (A and B) indicators.
-enum NalDefs : uint8_t { kFBit = 0x80, kNriMask = 0x60, kTypeMask = 0x1F };
-// Bit masks for FU (A and B) headers.
-enum FuDefs : uint8_t { kSBit = 0x80, kEBit = 0x40, kRBit = 0x20 };
-
-std::map<OBU_TYPE, std::string> obuType2String = {
-    {OBU_TYPE::OBU_SEQUENCE_HEADER, "sequence header"},
-    {OBU_TYPE::OBU_TEMPORAL_DELIMITER, "temporal delimiter"},
-    {OBU_TYPE::OBU_FRAME_HEADER, "frame header"},
-    {OBU_TYPE::OBU_TILE_GROUP, "tile group"},
-    {OBU_TYPE::OBU_METADATA, "metadata"},
-    {OBU_TYPE::OBU_FRAME, "frame"},
-    {OBU_TYPE::OBU_REDUNDANT_FRAME_HEADER, "redundant frame header"},
-    {OBU_TYPE::OBU_TILE_LIST, "tile_list"},
-    {OBU_TYPE::OBU_PADDING, "padding"},
-};
-
-std::map<uint8_t, std::string> nalType2String = {
-    {webrtc::H264::NaluType::kSlice, "slice"},
-    {webrtc::H264::NaluType::kIdr, "idr"},
-    {webrtc::H264::NaluType::kSei, "sei"},
-    {webrtc::H264::NaluType::kSps, "sps"},
-    {webrtc::H264::NaluType::kPps, "pps"},
-    {webrtc::H264::NaluType::kAud, "aud"},
-    {webrtc::H264::NaluType::kEndOfSequence, "end of sequence"},
-    {webrtc::H264::NaluType::kEndOfStream, "end of stream"},
-    {webrtc::H264::NaluType::kFiller, "filler"},
-    {webrtc::H264::NaluType::kStapA, "stap A"},
-    {webrtc::H264::NaluType::kFuA, "fu A"},
-};
-
-std::map<uint8_t, std::string> profileIdc2String = {
-    {66, "Baseline"}, {77, "Main"},        {88, "Extended"},    {100, "High"},
-    {110, "High 10"}, {122, "High 4:2:2"}, {144, "High 4:4:4"},
-};
-std::map<uint8_t, std::string> chromaFormatIdc2String = {
-    {0, "4:0:0"},
-    {1, "4:2:0"},
-    {2, "4:2:2"},
-    {3, "4:4:4"},
-};
-std::map<uint8_t, std::string> sliceType2String = {
-    {webrtc::H264::SliceType::kP, "P slice"},
-    {webrtc::H264::SliceType::kB, "B slice"},
-    {webrtc::H264::SliceType::kI, "I slice"},
-    {webrtc::H264::SliceType::kSp, "SP slice"},
-    {webrtc::H264::SliceType::kSi, "SI slice"},
-};
-std::map<uint8_t, std::string> entropyCodingMode2String = {
-    {0, "CAVLC"},
-    {1, "CABAC"},
-};
-
-/*
-   +-----------------------+-----------+-----------+-------------------+
-   | Configuration         | Mode      | Bandwidth | Frame Sizes       |
-   | Number(s)             |           |           |                   |
-   +-----------------------+-----------+-----------+-------------------+
-   | 0...3                 | SILK-only | NB        | 10, 20, 40, 60 ms |
-   |                       |           |           |                   |
-   | 4...7                 | SILK-only | MB        | 10, 20, 40, 60 ms |
-   |                       |           |           |                   |
-   | 8...11                | SILK-only | WB        | 10, 20, 40, 60 ms |
-   |                       |           |           |                   |
-   | 12...13               | Hybrid    | SWB       | 10, 20 ms         |
-   |                       |           |           |                   |
-   | 14...15               | Hybrid    | FB        | 10, 20 ms         |
-   |                       |           |           |                   |
-   | 16...19               | CELT-only | NB        | 2.5, 5, 10, 20 ms |
-   |                       |           |           |                   |
-   | 20...23               | CELT-only | WB        | 2.5, 5, 10, 20 ms |
-   |                       |           |           |                   |
-   | 24...27               | CELT-only | SWB       | 2.5, 5, 10, 20 ms |
-   |                       |           |           |                   |
-   | 28...31               | CELT-only | FB        | 2.5, 5, 10, 20 ms |
-   +-----------------------+-----------+-----------+-------------------+
-                                Table 2: TOC Byte Configuration Parameters
-*/
-/*
-   +----------------------+-----------------+-------------------------+
-   | Abbreviation         | Audio Bandwidth | Sample Rate (Effective) |
-   +----------------------+-----------------+-------------------------+
-   | NB (narrowband)      |           4 kHz |                   8 kHz |
-   |                      |                 |                         |
-   | MB (medium-band)     |           6 kHz |                  12 kHz |
-   |                      |                 |                         |
-   | WB (wideband)        |           8 kHz |                  16 kHz |
-   |                      |                 |                         |
-   | SWB (super-wideband) |          12 kHz |                  24 kHz |
-   |                      |                 |                         |
-   | FB (fullband)        |      20 kHz (*) |                  48 kHz |
-   +----------------------+-----------------+-------------------------+
-*/
 std::map<uint8_t, std::string> opusConfig2String = {
     {0, "SILK-only, 8kHz, 10ms"},    {1, "SILK-only, 8kHz, 20ms"},
     {2, "SILK-only, 8kHz, 40ms"},    {3, "SILK-only, 8kHz, 60ms"},
@@ -171,16 +77,7 @@ void XorPayloads(const uint8_t* src_data,
   }
 }
 
-void PayloadFlexFec::insertMediaPacket(webrtc::RtpPacket& rtpPacket) {
-  {
-    char buffer[1024];
-    sprintf(buffer, "rtp_packet/%u.packet", rtpPacket.SequenceNumber());
-    std::fstream f(buffer, std::ios::binary | std::ios::out);
-    f << std::string((char*)rtpPacket.data(), rtpPacket.size());
-  }
-
-  // packets.emplace(rtpPacket.SequenceNumber(), rtpPacket);
-
+void PayloadFlexFec::insertMediaPacket(webrtc::RtpPacketReceived& rtpPacket) {
   auto it = fecPackets.find(rtpPacket.SequenceNumber());
   if (it == fecPackets.end()) {
     return;
@@ -253,17 +150,9 @@ void PayloadFlexFec::insertMediaPacket(webrtc::RtpPacket& rtpPacket) {
   recovered_buffer.get()[0] &= 0xbf;
   webrtc::ByteWriter<uint16_t>::WriteBigEndian(recovered_buffer.get() + 2, seq);
   memcpy(recovered_buffer.get() + 8, buff + 12, 4);
-
-  //{
-  //	char buffer[1024];
-  //	sprintf(buffer, "fec_packet/%u.packet", rtpPacket.SequenceNumber());
-  //	std::fstream f(buffer, std::ios::binary | std::ios::out);
-  //	f << std::string((char*)recovered_buffer.get(), 12u +
-  //it->second.payload().size() - fecHeaderLen);
-  //}
 }
 
-void PayloadFlexFec::insertFecPacket(webrtc::RtpPacket& fecPacket) {
+void PayloadFlexFec::insertFecPacket(webrtc::RtpPacketReceived& fecPacket) {
   const auto& payload = fecPacket.payload();
   const uint8_t* buff = payload.data();
 
@@ -430,96 +319,29 @@ nlohmann::json PayloadFlexFec::parseR0F0(const uint8_t* buff, uint16_t length) {
 
   return nlohmann::json();
 
-  ///*
-  //		0                   1                   2                   3
-  //		0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-  //	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  //	   |0|0|P|X|  CC   |M| PT recovery |        length recovery        |
-  //	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  //	   |                          TS recovery                          |
-  //	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  //	   |   SSRCCount   |                    reserved                   |
-  //	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  //	   |                             SSRC_i                            |
-  //	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  //	   |           SN base_i           |k|          Mask [0-14]        |
-  //	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  //	   |k|                   Mask [15-45] (optional)                   |
-  //	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  //	   |k|                                                             |
-  //	   +-+                   Mask [46-108] (optional)                  |
-  //	   |                                                               |
-  //	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  //	   |                     ... next in SSRC_i ...                    |
-  //	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  //*/
-  // uint8_t padding = (buff[0] & 0x20) >> 5;
-  // uint8_t extension = (buff[0] & 0x10) >> 4;
-  // uint8_t csrcCount = buff[0] & 0x1f;
-  // uint8_t marker = (buff[1] & 0x80) >> 7;
-  // uint8_t ptRecovery = buff[1] & 0x7f;
-  // uint16_t lengthRecovery = webrtc::ByteReader<uint16_t>::ReadBigEndian(buff
-  // + 2); uint32_t tsRecovery = webrtc::ByteReader<uint32_t>::ReadBigEndian(buff
-  // + 4); uint8_t ssrcCount = buff[8]; uint32_t reserved =
-  // webrtc::ByteReader<uint32_t, 3>::ReadBigEndian(buff + 9);
-
-  // nlohmann::json header =
-  //	{
-  //		{"retransmission", 0},
-  //		{"inflexible", 0},
-  //		{"padding", padding},
-  //		{"extension", extension},
-  //		{"csrc_count", csrcCount},
-  //		{"marker", marker},
-  //		{"pt_recovery", ptRecovery},
-  //		{"length_recovery", lengthRecovery},
-  //		{"ts_recovery", tsRecovery},
-  //		{"ssrc_count", ssrcCount},
-  //		{"reserved", reserved}, // 保留字段
-  //		{"ssrc", nlohmann::json::array()},
-  //	};
-
-  // uint32_t offset{ 12 };
-  // for (uint8_t i = 0; i < ssrcCount; ++i)
-  //{
-  //	std::ostringstream oss;
-  //	uint32_t ssrc = webrtc::ByteReader<uint32_t>::ReadBigEndian(buff +
-  //offset); 	offset += 4; 	uint16_t snBase =
-  //webrtc::ByteReader<uint16_t>::ReadBigEndian(buff + offset); 	offset += 2;
-  //	nlohmann::json s =
-  //	{
-  //		{"ssrc", ssrc},
-  //		{"sn_base", snBase},
-  //	};
-
-  //	// 0-14
-  //	uint8_t kKBit = buff[offset] & 0x80;
-  //	uint16_t mask1 = webrtc::ByteReader<uint16_t>::ReadBigEndian(buff +
-  //offset) & 0x7fff; 	offset += 2; 	s["mask1"] =
-  //this->tobit<15>(mask1).to_string();
-
-  //	// 15-45
-  //	if (!kKBit)
-  //	{
-  //		kKBit = buff[offset] & 0x80;
-  //		uint32_t mask2 = webrtc::ByteReader<uint32_t>::ReadBigEndian(buff +
-  //offset) & 0x7fffffff; 		offset += 4; 		s["mask2"] =
-  //this->tobit<31>(mask2).to_string();
-  //	}
-
-  //	// 46-108
-  //	if (!kKBit)
-  //	{
-  //		kKBit = buff[offset] & 0x80;
-  //		uint64_t mask3 = webrtc::ByteReader<uint64_t>::ReadBigEndian(buff +
-  //offset) & 0x7fffffffffffffff; 		offset += 8; 		s["mask3"] =
-  //this->tobit<63>(mask3).to_string();
-  //	}
-
-  //	header["ssrc"].push_back(s);
-  //}
-  // header["payload_length"] = length - offset;
-  // return header;
+  /*
+  		0                   1                   2                   3
+  		0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+  	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  	   |0|0|P|X|  CC   |M| PT recovery |        length recovery        |
+  	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  	   |                          TS recovery                          |
+  	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  	   |   SSRCCount   |                    reserved                   |
+  	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  	   |                             SSRC_i                            |
+  	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  	   |           SN base_i           |k|          Mask [0-14]        |
+  	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  	   |k|                   Mask [15-45] (optional)                   |
+  	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  	   |k|                                                             |
+  	   +-+                   Mask [46-108] (optional)                  |
+  	   |                                                               |
+  	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  	   |                     ... next in SSRC_i ...                    |
+  	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  */
 }
 
 nlohmann::json PayloadFlexFec::parseR0F1(const uint8_t* buff, uint16_t length) {
@@ -656,1128 +478,46 @@ void PayloadFlexFec::setMask(char* const mask,
   }
 }
 
-nlohmann::json PayloadH264::parse(const uint8_t* buff, uint16_t length) {
-  const uint8_t* ptr = buff;
-  uint16_t offset{0};
-  std::ostringstream oss;
-
-  uint8_t forbidden_zero_bit = (ptr[0] & kFBit) >> 7;
-  uint8_t nal_ref_idc = (ptr[0] & kNriMask) >> 5;
-  uint8_t nal_type = ptr[0] & kTypeMask;
-  oss << uint16_t(nal_type) << "(" << nalType2String[nal_type] << ")";
-  nlohmann::json nalus = {
-      {"forbidden_zero_bit", forbidden_zero_bit},
-      {"nal_ref_idc", nal_ref_idc},
-      {"nalu_type", oss.str()},
-      {"payload_length", length},
-      {"video_codec", "h264"},
-      {"frame_key", 0},
-  };
-  // header
-  if (nal_type == webrtc::H264::NaluType::kFuA) {
-    /*
-             0                   1                   2                   3
-             0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            | FU indicator  |   FU header   |                               |
-            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               |
-            |                                                               |
-            |                         FU payload                            |
-            |                                                               |
-            |                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            |                               :...OPTIONAL RTP padding        |
-            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-       The FU indicator octet has the following format:
-               +---------------+
-               |0|1|2|3|4|5|6|7|
-               +-+-+-+-+-+-+-+-+
-               |F|NRI|  Type   |
-               +---------------+
-
-       The FU header has the following format:
-              +---------------+
-              |0|1|2|3|4|5|6|7|
-              +-+-+-+-+-+-+-+-+
-              |S|E|R|  Type   |
-              +---------------+
-    */
-    nalus["nalus"] = nlohmann::json::array();
-    offset += kNalHeaderSize;
-    uint8_t first_fragment = (ptr[offset] & kSBit) >> 7;
-    uint8_t last_fragment = (ptr[offset] & kEBit) >> 6;
-    uint8_t reserved = (ptr[offset] & kRBit) >> 5;
-    nal_type = ptr[offset] & kTypeMask;
-    uint16_t len = length - offset;
-    oss.str("");
-    oss << uint16_t(nal_type) << "(" << nalType2String[nal_type] << ")";
-    nlohmann::json nalu = {
-        {"first_fragment", first_fragment},
-        {"last_fragment", last_fragment},
-        {"reserved", reserved},
-        {"nalu_type", oss.str()},
-        {"nalu_length", len},
-    };
-    if (first_fragment) {
-      offset += kNalHeaderSize;
-      nalu["slice_header"] = this->parseSliceHeader(ptr + offset, len - 1);
-    }
-
-    if (nal_type == webrtc::H264::kIdr) {
-      nalus["frame_key"] = 1;
-    }
-    nalus["nalus"].push_back(nalu);
-  } else if (nal_type == webrtc::H264::NaluType::kStapA) {
-    /*
-             0                   1                   2                   3
-             0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            |                          RTP Header                           |
-            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            |STAP-A NAL HDR |         NALU 1 Size           | NALU 1 HDR    |
-            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            |                         NALU 1 Data                           |
-            :                                                               :
-            +               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            |               | NALU 2 Size                   | NALU 2 HDR    |
-            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            |                         NALU 2 Data                           |
-            :                                                               :
-            |                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            |                               :...OPTIONAL RTP padding        |
-            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-    */
-    nalus["nalus"] = nlohmann::json::array();
-    offset += kNalHeaderSize;
-    while (offset < length) {
-      uint16_t len = webrtc::ByteReader<uint16_t>::ReadBigEndian(ptr + offset);
-      offset += kLengthFieldSize;
-      forbidden_zero_bit = (ptr[offset] & kFBit) >> 7;
-      nal_ref_idc = (ptr[offset] & kNriMask) >> 5;
-      nal_type = ptr[offset] & kTypeMask;
-      oss.str("");
-      oss << uint16_t(nal_type) << "(" << nalType2String[nal_type] << ")";
-      nlohmann::json nalu = {
-          {"forbidden_zero_bit", forbidden_zero_bit},
-          {"nal_ref_idc", nal_ref_idc},
-          {"nalu_type", oss.str()},
-          {"nalu_length", len},
-      };
-
-      uint16_t offset2 = offset + kNalHeaderSize;
-      switch (nal_type) {
-        case webrtc::H264::kSlice: {
-          nalu["slice_header"] = this->parseSliceHeader(ptr + offset2, len - 1);
-        } break;
-        case webrtc::H264::kIdr:
-          nalus["frame_key"] = 1;
-          break;
-        case webrtc::H264::kSei:
-          break;
-        case webrtc::H264::kSps: {
-          nalu["sps"] = this->parseSps(ptr + offset2, len - 1);
-        } break;
-        case webrtc::H264::kPps: {
-          nalu["pps"] = this->parsePps(ptr + offset2, len - 1);
-        } break;
-        case webrtc::H264::kAud:
-          break;
-        case webrtc::H264::kEndOfSequence:
-          break;
-        case webrtc::H264::kEndOfStream:
-          break;
-        case webrtc::H264::kFiller:
-          break;
-        case webrtc::H264::kStapA:
-          break;
-        case webrtc::H264::kFuA:
-          break;
-        default:
-          break;
-      }
-      nalus["nalus"].push_back(nalu);
-      offset += len;
-    }
-  } else {
-    nalus["nalu_length"] = length;
-  }
-  return nalus;
-}
-
-// https://www.itu.int/rec/T-REC-H.264 T-REC-H.264-201402-S 7.3.2.1.1
-nlohmann::json PayloadH264::parseSps(const uint8_t* buff, uint16_t length) {
-  this->separate_colour_plane_flag = 0;
-  this->frame_mbs_only_flag = 0;
-  this->pic_order_cnt_type = 0;
-  this->delta_pic_order_always_zero_flag = 0;
-  this->log2_max_frame_num = 0;
-  this->log2_max_pic_order_cnt_lsb = 0;
-
-  // framerate = sps->vui.vui_time_scale / sps->vui.vui_num_units_in_tick / 2;
-  std::unique_ptr<rtc::BitBuffer> buffer(new rtc::BitBuffer(buff, length));
-
-  // profile_idc和level_idc指示编码视频序列符合的配置文件和级别
-  uint8_t profile_idc{0};
-  // 编码约束
-  uint32_t constraint_set0_flag{0};
-  uint32_t constraint_set1_flag{0};
-  uint32_t constraint_set2_flag{0};
-  uint32_t constraint_set3_flag{0};
-  uint32_t constraint_set4_flag{0};
-  uint32_t constraint_set5_flag{0};
-  uint32_t reserved_zero_2bit{0};
-
-  uint8_t level_idc{0};
-  uint32_t seq_parameter_set_id{0};
-  uint32_t chroma_format_idc{1};
-
-  // 等于1表示4:4:4色度格式的三个颜色分量分别编码
-  uint32_t separate_colour_plane_flag{0};
-
-  // 亮度样本的位深
-  uint32_t bit_depth_luma_minus8{0};
-  // 色度样本的位深
-  uint32_t bit_depth_chroma_minus8{0};
-
-  uint32_t qpprime_y_zero_transform_bypass_flag{0};
-  uint32_t seq_scaling_matrix_present_flag{0};
-  uint32_t seq_scaling_list_present_flag{0};
-
-  // 一个gop中最大帧的数量 2的(log2_max_frame_num_minus4+4)次方
-  uint32_t log2_max_frame_num_minus4{0};
-
-  // 计算显示帧顺序的
-  uint32_t pic_order_cnt_type{0};
-  uint32_t log2_max_pic_order_cnt_lsb_minus4{0};
-  uint32_t delta_pic_order_always_zero_flag{0};
-  uint32_t offset_for_non_ref_pic{0};
-  uint32_t offset_for_top_to_bottom_field{0};
-  uint32_t num_ref_frames_in_pic_order_cnt_cycle{0};
-  uint32_t offset_for_ref_frame{0};
-
-  // 最大参考帧数
-  uint32_t max_num_ref_frames{0};
-  // 不重要的参数
-  uint32_t gaps_in_frame_num_value_allowed_flag{0};
-
-  // 宽=(pic_width_in_mbs_minus1 + 1) * 16
-  uint32_t pic_width_in_mbs_minus1{0};
-  // 高=(pic_height_in_map_units_minus1 + 1) * (2 - frame_mbs_only_flag) * 16
-  uint32_t pic_height_in_map_units_minus1{0};
-
-  // 0场编码 1帧编码(场是隔行扫描，产生两张图片)
-  uint32_t frame_mbs_only_flag{0};
-
-  uint32_t mb_adaptive_frame_field_flag{0};
-  uint32_t direct_8x8_inference_flag{0};
-  // 视频裁剪
-  uint32_t frame_cropping_flag{0};
-  uint32_t frame_crop_left_offset{0};
-  uint32_t frame_crop_right_offset{0};
-  uint32_t frame_crop_top_offset{0};
-  uint32_t frame_crop_bottom_offset{0};
-
-  uint32_t vui_parameters_present_flag{0};
-
-  std::ostringstream oss;
-  nlohmann::json psp;
-
-  buffer->ReadUInt8(&profile_idc);  // u(8)
-  oss << uint16_t(profile_idc) << "(" << profileIdc2String[profile_idc] << ")";
-  psp["profile_idc"] = oss.str();
-  buffer->ReadBits(&constraint_set0_flag, 1);  // u(1)
-  psp["constraint_set0_flag"] = constraint_set0_flag;
-  buffer->ReadBits(&constraint_set1_flag, 1);  // u(1)
-  psp["constraint_set1_flag"] = constraint_set1_flag;
-  buffer->ReadBits(&constraint_set2_flag, 1);  // u(1)
-  psp["constraint_set2_flag"] = constraint_set2_flag;
-  buffer->ReadBits(&constraint_set3_flag, 1);  // u(1)
-  psp["constraint_set3_flag"] = constraint_set3_flag;
-  buffer->ReadBits(&constraint_set4_flag, 1);  // u(1)
-  psp["constraint_set4_flag"] = constraint_set4_flag;
-  buffer->ReadBits(&constraint_set5_flag, 1);  // u(1)
-  psp["constraint_set5_flag"] = constraint_set5_flag;
-  buffer->ReadBits(&reserved_zero_2bit, 2);  // u(2)
-  psp["reserved_zero_2bit"] = reserved_zero_2bit;
-  buffer->ReadUInt8(&level_idc);  // u(8)
-  psp["level_idc"] = level_idc;
-  buffer->ReadExponentialGolomb(&seq_parameter_set_id);  // ue(v)
-  psp["seq_parameter_set_id"] = seq_parameter_set_id;
-  if (profile_idc == 100 || profile_idc == 110 || profile_idc == 122 ||
-      profile_idc == 244 || profile_idc == 44 || profile_idc == 83 ||
-      profile_idc == 86 || profile_idc == 118 || profile_idc == 128 ||
-      profile_idc == 138 || profile_idc == 139 || profile_idc == 134) {
-    buffer->ReadExponentialGolomb(&chroma_format_idc);  // ue(v)
-    oss.str("");
-    oss << chroma_format_idc << "(" << chromaFormatIdc2String[chroma_format_idc]
-        << ")";
-    psp["chroma_format_idc"] = oss.str();
-    if (chroma_format_idc == 3) {
-      buffer->ReadBits(&separate_colour_plane_flag, 1);  // u(1)
-      psp["separate_colour_plane_flag"] = separate_colour_plane_flag;
-    }
-    buffer->ReadExponentialGolomb(&bit_depth_luma_minus8);  // ue(v)
-    oss.str("");
-    oss << bit_depth_luma_minus8 << "(" << 8 + bit_depth_luma_minus8 << ")";
-    psp["bit_depth_luma_minus8"] = oss.str();
-    buffer->ReadExponentialGolomb(&bit_depth_chroma_minus8);  // ue(v)
-    oss.str("");
-    oss << bit_depth_chroma_minus8 << "(" << 8 + bit_depth_chroma_minus8 << ")";
-    psp["bit_depth_chroma_minus8"] = oss.str();
-    buffer->ReadBits(&qpprime_y_zero_transform_bypass_flag, 1);  // u(1)
-    psp["qpprime_y_zero_transform_bypass_flag"] =
-        qpprime_y_zero_transform_bypass_flag;
-    buffer->ReadBits(&seq_scaling_matrix_present_flag, 1);  // u(1)
-    psp["seq_scaling_matrix_present_flag"] = seq_scaling_matrix_present_flag;
-    if (seq_scaling_matrix_present_flag) {
-      psp["seq_scaling_list_present_flag"] = nlohmann::json::array();
-      uint32_t scaling_list_count = (chroma_format_idc != 3 ? 8 : 12);
-      for (uint32_t i = 0; i < scaling_list_count; ++i) {
-        buffer->ReadBits(&seq_scaling_list_present_flag, 1);  // u(1)
-        psp["seq_scaling_list_present_flag"].push_back(
-            seq_scaling_list_present_flag);
-      }
-    }
-  }
-  buffer->ReadExponentialGolomb(&log2_max_frame_num_minus4);  // ue(v)
-  oss.str("");
-  oss << log2_max_frame_num_minus4 << "("
-      << std::pow(2, log2_max_frame_num_minus4 + 4) << ")";
-  psp["log2_max_frame_num_minus4"] = oss.str();
-  buffer->ReadExponentialGolomb(&pic_order_cnt_type);  // ue(v)
-  psp["pic_order_cnt_type"] = pic_order_cnt_type;
-  if (pic_order_cnt_type == 0) {
-    buffer->ReadExponentialGolomb(&log2_max_pic_order_cnt_lsb_minus4);  // ue(v)
-    oss.str("");
-    oss << log2_max_pic_order_cnt_lsb_minus4 << "("
-        << std::pow(2, log2_max_pic_order_cnt_lsb_minus4 + 4) << ")";
-    psp["log2_max_pic_order_cnt_lsb_minus4"] = oss.str();
-  } else if (pic_order_cnt_type == 1) {
-    buffer->ReadBits(&delta_pic_order_always_zero_flag, 1);  // u(1)
-    psp["delta_pic_order_always_zero_flag"] = delta_pic_order_always_zero_flag;
-    buffer->ReadExponentialGolomb(&offset_for_non_ref_pic);  // se(v)
-    psp["offset_for_non_ref_pic"] = offset_for_non_ref_pic;
-    buffer->ReadExponentialGolomb(&offset_for_top_to_bottom_field);  // se(v)
-    psp["offset_for_top_to_bottom_field"] = offset_for_top_to_bottom_field;
-    buffer->ReadExponentialGolomb(
-        &num_ref_frames_in_pic_order_cnt_cycle);  // ue(v)
-    psp["num_ref_frames_in_pic_order_cnt_cycle"] =
-        num_ref_frames_in_pic_order_cnt_cycle;
-    psp["offset_for_ref_frame"] = nlohmann::json::array();
-    for (uint32_t i = 0; i < num_ref_frames_in_pic_order_cnt_cycle; ++i) {
-      buffer->ReadExponentialGolomb(&offset_for_ref_frame);  // se(v)
-      psp["offset_for_ref_frame"].push_back(offset_for_ref_frame);
-    }
-  }
-  buffer->ReadExponentialGolomb(&max_num_ref_frames);  // ue(v)
-  psp["max_num_ref_frames"] = max_num_ref_frames;
-  buffer->ReadBits(&gaps_in_frame_num_value_allowed_flag, 1);  // u(1)
-  psp["max_num_regaps_in_frame_num_value_allowed_flagf_frames"] =
-      gaps_in_frame_num_value_allowed_flag;
-  buffer->ReadExponentialGolomb(&pic_width_in_mbs_minus1);  // ue(v)
-  oss.str("");
-  oss << pic_width_in_mbs_minus1 << "(" << (pic_width_in_mbs_minus1 + 1) * 16
-      << ")";
-  psp["pic_width_in_mbs_minus1"] = oss.str();
-  buffer->ReadExponentialGolomb(&pic_height_in_map_units_minus1);  // ue(v)
-  buffer->ReadBits(&frame_mbs_only_flag, 1);                       // u(1)
-  oss.str("");
-  oss << pic_height_in_map_units_minus1 << "("
-      << (pic_height_in_map_units_minus1 + 1) * (2 - frame_mbs_only_flag) * 16
-      << ")";
-  psp["pic_height_in_map_units_minus1"] = pic_height_in_map_units_minus1;
-  psp["frame_mbs_only_flag"] = frame_mbs_only_flag;
-  if (!frame_mbs_only_flag) {
-    buffer->ReadBits(&mb_adaptive_frame_field_flag, 1);  // u(1)
-    psp["mb_adaptive_frame_field_flag"] = mb_adaptive_frame_field_flag;
-  }
-  buffer->ReadBits(&direct_8x8_inference_flag, 1);  // u(1)
-  psp["direct_8x8_inference_flag"] = direct_8x8_inference_flag;
-  buffer->ReadBits(&frame_cropping_flag, 1);  // u(1)
-  psp["frame_cropping_flag"] = frame_cropping_flag;
-  if (frame_cropping_flag) {
-    buffer->ReadExponentialGolomb(&frame_crop_left_offset);  // ue(v)
-    psp["frame_crop_left_offset"] = frame_crop_left_offset;
-    buffer->ReadExponentialGolomb(&frame_crop_right_offset);  // ue(v)
-    psp["frame_crop_right_offset"] = frame_crop_right_offset;
-    buffer->ReadExponentialGolomb(&frame_crop_top_offset);  // ue(v)
-    psp["frame_crop_top_offset"] = frame_crop_top_offset;
-    buffer->ReadExponentialGolomb(&frame_crop_bottom_offset);  // ue(v)
-    psp["frame_crop_bottom_offset"] = frame_crop_bottom_offset;
-  }
-  buffer->ReadBits(&vui_parameters_present_flag, 1);  // u(1)
-  psp["vui_parameters_present_flag"] = vui_parameters_present_flag;
-  if (vui_parameters_present_flag) {
-  }
-
-  this->separate_colour_plane_flag = separate_colour_plane_flag;
-  this->frame_mbs_only_flag = frame_mbs_only_flag;
-  this->pic_order_cnt_type = pic_order_cnt_type;
-  this->delta_pic_order_always_zero_flag = delta_pic_order_always_zero_flag;
-  this->log2_max_frame_num = log2_max_frame_num_minus4 + 4;
-  this->log2_max_pic_order_cnt_lsb = log2_max_pic_order_cnt_lsb_minus4 + 4;
-  return psp;
-}
-
-// https://www.itu.int/rec/T-REC-H.264 T-REC-H.264-201402-S 7.3.2.2
-nlohmann::json PayloadH264::parsePps(const uint8_t* buff, uint16_t length) {
-  this->bottom_field_pic_order_in_frame_present_flag = 0;
-  this->redundant_pic_cnt_present_flag = 0;
-  this->entropy_coding_mode_flag = 0;
-  this->deblocking_filter_control_present_flag = 0;
-  this->num_slice_groups_minus1 = 0;
-  this->slice_group_map_type = 0;
-  std::unique_ptr<rtc::BitBuffer> buffer(new rtc::BitBuffer(buff, length));
-
-  uint32_t pic_parameter_set_id{0};
-  uint32_t seq_parameter_set_id{0};
-  // 熵编码模式
-  uint32_t entropy_coding_mode_flag{0};
-
-  // 场编码相关信息标志
-  uint32_t bottom_field_pic_order_in_frame_present_flag{0};
-  // 一帧中的slice个数
-  uint32_t num_slice_groups_minus1{0};
-
-  uint32_t slice_group_map_type{0};
-  uint32_t run_length_minus1{0};
-  uint32_t top_left{0};
-  uint32_t bottom_right{0};
-  uint32_t slice_group_change_direction_flag{0};
-  uint32_t slice_group_change_rate_minus1{0};
-  uint32_t pic_size_in_map_units_minus1{0};
-  uint32_t slice_group_id{0};
-  uint32_t num_ref_idx_l0_default_active_minus1{0};
-  uint32_t num_ref_idx_l1_default_active_minus1{0};
-  // 在P/SP slice中是否开启权重预测
-  uint32_t weighted_pred_flag{0};
-  // 在B slice中加权预测的方法id
-  uint32_t weighted_bipred_idc{0};
-  // 初始化量化参数，实际参数在slice header中
-  uint32_t pic_init_qp_minus26{0};
-  uint32_t pic_init_qs_minus26{0};
-  // 用于计算色度分量的量化参数
-  uint32_t chroma_qp_index_offset{0};
-  // 表示slice header中是否存在用于去块滤波器控制的信息
-  uint32_t deblocking_filter_control_present_flag{0};
-  // 表示I宏块在进行帧内预测时只能使用来自I和SI类型的宏块信息
-  uint32_t constrained_intra_pred_flag{0};
-  // 用于表示slice header中是否存在redundant_pic_cnt语法元素
-  uint32_t redundant_pic_cnt_present_flag{0};
-
-  uint32_t transform_8x8_mode_flag{0};
-  uint32_t pic_scaling_matrix_present_flag{0};
-  uint32_t pic_scaling_list_present_flag{0};
-  uint32_t second_chroma_qp_index_offset{0};
-
-  std::ostringstream oss;
-  nlohmann::json pps;
-
-  buffer->ReadExponentialGolomb(&pic_parameter_set_id);  // ue(v)
-  pps["pic_parameter_set_id"] = pic_parameter_set_id;
-  buffer->ReadExponentialGolomb(&seq_parameter_set_id);  // ue(v)
-  pps["seq_parameter_set_id"] = seq_parameter_set_id;
-  buffer->ReadBits(&entropy_coding_mode_flag, 1);  // u(1)
-  oss << entropy_coding_mode_flag << "("
-      << entropyCodingMode2String[entropy_coding_mode_flag] << ")";
-  pps["entropy_coding_mode_flag"] = oss.str();
-  buffer->ReadBits(&bottom_field_pic_order_in_frame_present_flag, 1);  // u(1)
-  pps["bottom_field_pic_order_in_frame_present_flag"] =
-      bottom_field_pic_order_in_frame_present_flag;
-  buffer->ReadExponentialGolomb(&num_slice_groups_minus1);  // ue(v)
-  oss.str("");
-  oss << num_slice_groups_minus1 << "(" << num_slice_groups_minus1 + 1 << ")";
-  pps["num_slice_groups_minus1"] = oss.str();
-  if (num_slice_groups_minus1 > 0) {
-    buffer->ReadExponentialGolomb(&slice_group_map_type);  // ue(v)
-    pps["slice_group_map_type"] = slice_group_map_type;
-    if (slice_group_map_type == 0) {
-      pps["run_length_minus1"] = nlohmann::json::array();
-      for (uint32_t i = 0; i <= num_slice_groups_minus1; ++i) {
-        buffer->ReadExponentialGolomb(&run_length_minus1);  // ue(v)
-        pps["run_length_minus1"].push_back(run_length_minus1);
-      }
-    } else if (slice_group_map_type == 2) {
-      pps["top_left_bottom_right"] = nlohmann::json::array();
-      for (uint32_t i = 0; i <= num_slice_groups_minus1; ++i) {
-        nlohmann::json top_left_bottom_right;
-        buffer->ReadExponentialGolomb(&top_left);  // ue(v)
-        top_left_bottom_right["top_left"] = top_left;
-        buffer->ReadExponentialGolomb(&bottom_right);  // ue(v)
-        top_left_bottom_right["bottom_right"] = bottom_right;
-        pps["top_left_bottom_right"].push_back(top_left_bottom_right);
-      }
-    } else if (slice_group_map_type == 3 || slice_group_map_type == 4 ||
-               slice_group_map_type == 5) {
-      buffer->ReadBits(&slice_group_change_direction_flag, 1);  // u(1)
-      pps["slice_group_change_direction_flag"] =
-          slice_group_change_direction_flag;
-      buffer->ReadExponentialGolomb(&slice_group_change_rate_minus1);  // ue(v)
-      pps["slice_group_change_rate_minus1"] = slice_group_change_rate_minus1;
-    } else if (slice_group_map_type == 6) {
-      buffer->ReadExponentialGolomb(&pic_size_in_map_units_minus1);  // ue(v)
-      pps["pic_size_in_map_units_minus1"] = pic_size_in_map_units_minus1;
-
-      uint32_t slice_group_id_bits = 0;
-      uint32_t num_slice_groups = num_slice_groups_minus1 + 1;
-      if ((num_slice_groups & (num_slice_groups - 1)) != 0) {
-        ++slice_group_id_bits;
-      }
-      while (num_slice_groups > 0) {
-        num_slice_groups >>= 1;
-        ++slice_group_id_bits;
-      }
-      pps["slice_group_id"] = nlohmann::json::array();
-      for (uint32_t i = 0; i <= pic_size_in_map_units_minus1; ++i) {
-        buffer->ReadBits(&slice_group_id, slice_group_id_bits);  // u(v)
-        pps["slice_group_id"].push_back(slice_group_id);
-      }
-    }
-  }
-  buffer->ReadExponentialGolomb(
-      &num_ref_idx_l0_default_active_minus1);  // ue(v)
-  pps["num_ref_idx_l0_default_active_minus1"] =
-      num_ref_idx_l0_default_active_minus1;
-  buffer->ReadExponentialGolomb(
-      &num_ref_idx_l1_default_active_minus1);  // ue(v)
-  pps["num_ref_idx_l1_default_active_minus1"] =
-      num_ref_idx_l1_default_active_minus1;
-  buffer->ReadBits(&weighted_pred_flag, 1);  // u(1)
-  pps["weighted_pred_flag"] = weighted_pred_flag;
-  buffer->ReadBits(&weighted_bipred_idc, 2);  // u(2)
-  pps["weighted_bipred_idc"] = weighted_bipred_idc;
-  buffer->ReadExponentialGolomb(&pic_init_qp_minus26);  // se(v)
-  pps["pic_init_qp_minus26"] = pic_init_qp_minus26;
-  buffer->ReadExponentialGolomb(&pic_init_qs_minus26);  // se(v)
-  pps["pic_init_qs_minus26"] = pic_init_qs_minus26;
-  buffer->ReadExponentialGolomb(&chroma_qp_index_offset);  // se(v)
-  pps["chroma_qp_index_offset"] = chroma_qp_index_offset;
-  buffer->ReadBits(&deblocking_filter_control_present_flag, 1);  // u(1)
-  pps["deblocking_filter_control_present_flag"] =
-      deblocking_filter_control_present_flag;
-  buffer->ReadBits(&constrained_intra_pred_flag, 1);  // u(1)
-  pps["constrained_intra_pred_flag"] = constrained_intra_pred_flag;
-  buffer->ReadBits(&redundant_pic_cnt_present_flag, 1);  // u(1)
-  pps["redundant_pic_cnt_present_flag"] = redundant_pic_cnt_present_flag;
-
-  this->bottom_field_pic_order_in_frame_present_flag =
-      bottom_field_pic_order_in_frame_present_flag;
-  this->redundant_pic_cnt_present_flag = redundant_pic_cnt_present_flag;
-  this->entropy_coding_mode_flag = entropy_coding_mode_flag;
-  this->deblocking_filter_control_present_flag =
-      deblocking_filter_control_present_flag;
-  this->num_slice_groups_minus1 = num_slice_groups_minus1;
-  this->slice_group_map_type = slice_group_map_type;
-  return pps;
-}
-
-nlohmann::json PayloadH264::parseSliceHeader(const uint8_t* buff,
-                                             uint16_t length) {
-  std::unique_ptr<rtc::BitBuffer> buffer(new rtc::BitBuffer(buff, length));
-
-  uint32_t first_mb_in_slice{0};
-  uint32_t slice_type{0};
-  uint32_t pic_parameter_set_id{0};
-  uint32_t colour_plane_id{0};
-  // 解码帧号
-  uint32_t frame_num{0};
-
-  uint32_t field_pic_flag{0};
-  uint32_t bottom_field_flag{0};
-  uint32_t idr_pic_id{0};
-  uint32_t pic_order_cnt_lsb{0};
-  uint32_t delta_pic_order_cnt_bottom{0};
-  uint32_t delta_pic_order_cnt{0};
-  uint32_t redundant_pic_cnt{0};
-  uint32_t direct_spatial_mv_pred_flag{0};
-  uint32_t num_ref_idx_active_override_flag{0};
-  uint32_t num_ref_idx_l0_active_minus1{0};
-  uint32_t num_ref_idx_l1_active_minus1{0};
-  uint32_t cabac_init_idc{0};
-  uint32_t slice_qp_delta{0};
-  uint32_t sp_for_switch_flag{0};
-  uint32_t slice_qs_delta{0};
-  // 区块滤波
-  uint32_t disable_deblocking_filter_idc{0};
-
-  uint32_t slice_alpha_c0_offset_div2{0};
-  uint32_t slice_beta_offset_div2{0};
-  uint32_t slice_group_change_cycle{0};
-
-  std::ostringstream oss;
-  nlohmann::json slice_header;
-
-  buffer->ReadExponentialGolomb(&first_mb_in_slice);  // ue(v)
-  slice_header["first_mb_in_slice"] = first_mb_in_slice;
-  buffer->ReadExponentialGolomb(&slice_type);  // ue(v)
-  oss << slice_type << "(" << sliceType2String[slice_type] << ")";
-  slice_header["slice_type"] = oss.str();
-  buffer->ReadExponentialGolomb(&pic_parameter_set_id);  // ue(v)
-  slice_header["pic_parameter_set_id"] = pic_parameter_set_id;
-  if (this->separate_colour_plane_flag == 1) {
-    buffer->ReadBits(&colour_plane_id, 2);  // u(2)
-    slice_header["colour_plane_id"] = colour_plane_id;
-  }
-  buffer->ReadBits(&frame_num, this->log2_max_frame_num);  // u(v)
-  slice_header["frame_num"] = frame_num;
-  if (!this->frame_mbs_only_flag) {
-    buffer->ReadBits(&field_pic_flag, 1);  // u(1)
-    slice_header["field_pic_flag"] = field_pic_flag;
-    if (field_pic_flag) {
-      buffer->ReadBits(&bottom_field_flag, 1);  // u(1)
-      slice_header["bottom_field_flag"] = bottom_field_flag;
-    }
-  }
-  bool is_idr = (buff[0] & 0x0F) == webrtc::H264::NaluType::kIdr;
-  if (is_idr) {
-    buffer->ReadExponentialGolomb(&idr_pic_id);  // ue(v)
-    slice_header["idr_pic_id"] = idr_pic_id;
-  }
-  if (this->pic_order_cnt_type == 0) {
-    buffer->ReadBits(&pic_order_cnt_lsb,
-                     this->log2_max_pic_order_cnt_lsb);  // u(v)
-    slice_header["pic_order_cnt_lsb"] = pic_order_cnt_lsb;
-    if (bottom_field_pic_order_in_frame_present_flag && !field_pic_flag) {
-      buffer->ReadExponentialGolomb(&delta_pic_order_cnt_bottom);  // se(v)
-      slice_header["delta_pic_order_cnt_bottom"] = delta_pic_order_cnt_bottom;
-    }
-  }
-  if (this->pic_order_cnt_type == 1 &&
-      !this->delta_pic_order_always_zero_flag) {
-    slice_header["delta_pic_order_cnt"] = nlohmann::json::array();
-    buffer->ReadExponentialGolomb(&delta_pic_order_cnt);  // se(v)
-    slice_header["delta_pic_order_cnt"].push_back(delta_pic_order_cnt);
-    if (bottom_field_pic_order_in_frame_present_flag && !field_pic_flag) {
-      buffer->ReadExponentialGolomb(&delta_pic_order_cnt);  // se(v)
-      slice_header["delta_pic_order_cnt"].push_back(delta_pic_order_cnt);
-    }
-  }
-  if (this->redundant_pic_cnt_present_flag) {
-    buffer->ReadExponentialGolomb(&redundant_pic_cnt);  // ue(v)
-    slice_header["redundant_pic_cnt"] = redundant_pic_cnt;
-  }
-  if (slice_type == webrtc::H264::SliceType::kB) {
-    buffer->ReadBits(&direct_spatial_mv_pred_flag, 1);  // u(1)
-    slice_header["direct_spatial_mv_pred_flag"] = direct_spatial_mv_pred_flag;
-  }
-  if (slice_type == webrtc::H264::SliceType::kP ||
-      slice_type == webrtc::H264::SliceType::kSp ||
-      slice_type == webrtc::H264::SliceType::kB) {
-    buffer->ReadBits(&num_ref_idx_active_override_flag, 1);  // u(1)
-    slice_header["num_ref_idx_active_override_flag"] =
-        num_ref_idx_active_override_flag;
-    if (num_ref_idx_active_override_flag) {
-      buffer->ReadExponentialGolomb(&num_ref_idx_l0_active_minus1);  // ue(v)
-      slice_header["num_ref_idx_l0_active_minus1"] =
-          num_ref_idx_l0_active_minus1;
-      if (slice_type == webrtc::H264::SliceType::kB) {
-        buffer->ReadExponentialGolomb(&num_ref_idx_l1_active_minus1);  // ue(v)
-        slice_header["num_ref_idx_l1_active_minus1"] =
-            num_ref_idx_l1_active_minus1;
-      }
-    }
-  }
-  if (this->entropy_coding_mode_flag &&
-      slice_type != webrtc::H264::SliceType::kI &&
-      slice_type != webrtc::H264::SliceType::kSi) {
-    buffer->ReadExponentialGolomb(&cabac_init_idc);  // ue(v)
-    slice_header["cabac_init_idc"] = cabac_init_idc;
-  }
-  buffer->ReadExponentialGolomb(&slice_qp_delta);  // se(v)
-  slice_header["slice_qp_delta"] = slice_qp_delta;
-  if (slice_type == webrtc::H264::SliceType::kSp ||
-      slice_type == webrtc::H264::SliceType::kSi) {
-    if (slice_type == webrtc::H264::SliceType::kSp) {
-      buffer->ReadBits(&sp_for_switch_flag, 1);  // u(1)
-      slice_header["sp_for_switch_flag"] = sp_for_switch_flag;
-    }
-    buffer->ReadExponentialGolomb(&slice_qs_delta);  // se(v)
-    slice_header["slice_qs_delta"] = slice_qs_delta;
-  }
-  if (this->deblocking_filter_control_present_flag) {
-    buffer->ReadExponentialGolomb(&disable_deblocking_filter_idc);  // ue(v)
-    slice_header["disable_deblocking_filter_idc"] =
-        disable_deblocking_filter_idc;
-    if (disable_deblocking_filter_idc != 1) {
-      buffer->ReadExponentialGolomb(&slice_alpha_c0_offset_div2);  // se(v)
-      slice_header["slice_alpha_c0_offset_div2"] = slice_alpha_c0_offset_div2;
-      buffer->ReadExponentialGolomb(&slice_beta_offset_div2);  // se(v)
-      slice_header["slice_beta_offset_div2"] = slice_beta_offset_div2;
-    }
-  }
-  if (this->num_slice_groups_minus1 > 0 && this->slice_group_map_type >= 3 &&
-      this->slice_group_map_type <= 5) {
-    // buffer->ReadBits(&slice_group_change_cycle, v); // u(v)
-    slice_header["slice_group_change_cycle"] = "null";
-  }
-  return slice_header;
-}
-
-PayloadAV1::PayloadAV1() {}
-
-nlohmann::json PayloadAV1::parse(const uint8_t* buff, uint16_t length) {
   /*
-     0 1 2 3 4 5 6 7
-    +-+-+-+-+-+-+-+-+
-    |Z|Y| W |N|-|-|-|
-    +-+-+-+-+-+-+-+-+
-  */
-  uint8_t aggregation_header = buff[0];
-  uint16_t continues_obu =
-      (aggregation_header & 0b1000'0000u) >> 7;  // 非第一个OBU
-  uint16_t expect_continues_obu =
-      (aggregation_header & 0b0100'0000u) >> 6;  // 非最后一个OBU
-  uint16_t num_expected_obus =
-      (aggregation_header & 0b0011'0000u) >> 4;  // OBU元素个数
-  uint16_t frame_key = (aggregation_header & 0b0000'1000u) >> 3;  // 关键帧
-
-  nlohmann::json obus = {
-      {
-          "aggregation_header",
-          {
-              {"continues_obu", continues_obu},
-              {"expect_continues_obu", expect_continues_obu},
-              {"num_expected_obus", num_expected_obus},
-          },
-      },
-      {"payload_length", length},
-      {"video_codec", "av1"},
-      {"frame_key", frame_key},
-  };
-  payloads_.push_back({buff, length});
-  if (expect_continues_obu == 1) {
-    return obus;
-  }
-
-  webrtc::VideoRtpDepacketizerAv1 depacketizer;
-  
-  std::vector<rtc::ArrayView<const uint8_t>> rtp_payloads(payloads_.begin(), payloads_.end());
-  rtc::scoped_refptr<webrtc::EncodedImageBuffer> bitstream =
-      depacketizer.AssembleFrame(rtp_payloads);
-  payloads_.clear();
-
-  if (!context_) {
-    context_.reset(new aom_codec_ctx_t);
-
-    aom_codec_dec_cfg_t config = {8u,  // Max # of threads.
-                                  0,   // Frame width set after decode.
-                                  0,   // Frame height set after decode.
-                                  1};  // Enable low-bit-depth code path.
-    aom_codec_err_t ret =
-        aom_codec_dec_init(context_.get(), aom_codec_av1_dx(), &config, 0);
-
-    if (ret != AOM_CODEC_OK) {
-      RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::InitDecode returned " << ret
-                          << " on aom_codec_dec_init.";
-      context_.reset();
-      return WEBRTC_VIDEO_CODEC_OK;
-    }
-  }
-
-  aom_codec_err_t ret =
-      aom_codec_decode(context_.get(), bitstream->data(), bitstream->size(),
-                       /*user_priv=*/nullptr);
-  if (ret != AOM_CODEC_OK) {
-    RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::Decode returned " << ret
-                        << " on aom_codec_decode.";
-    return nlohmann::json();
-  }
-
-  // Get decoded frame data.
-  int corrupted_frame = 0;
-  aom_codec_iter_t iter = nullptr;
-  while (aom_image_t* decoded_image =
-             aom_codec_get_frame(context_.get(), &iter)) {
-    if (aom_codec_control(context_.get(), AOMD_GET_FRAME_CORRUPTED,
-                          &corrupted_frame)) {
-      RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::Decode "
-                             "AOM_GET_FRAME_CORRUPTED.";
-    }
-    // Check that decoded image format is I420 and has 8-bit depth.
-    if (decoded_image->fmt != AOM_IMG_FMT_I420) {
-      RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::Decode invalid image format";
-      return WEBRTC_VIDEO_CODEC_ERROR;
-    }
-
-    // Return decoded frame data.
-    int qp;
-    ret = aom_codec_control(context_.get(), AOMD_GET_LAST_QUANTIZER, &qp);
-    if (ret != AOM_CODEC_OK) {
-      RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::Decode returned " << ret
-                          << " on control AOME_GET_LAST_QUANTIZER.";
-      return WEBRTC_VIDEO_CODEC_ERROR;
-    }
-
-    // Allocate memory for decoded frame.
-    rtc::scoped_refptr<webrtc::I420Buffer> buffer =
-        buffer_pool_.CreateI420Buffer(decoded_image->d_w, decoded_image->d_h);
-    if (!buffer.get()) {
-      // Pool has too many pending frames.
-      RTC_LOG(LS_WARNING) << "LibaomAv1Decoder::Decode returned due to lack of"
-                             " space in decoded frame buffer pool.";
-      return WEBRTC_VIDEO_CODEC_ERROR;
-    }
-
-    // Copy decoded_image to decoded_frame.
-    libyuv::I420Copy(
-        decoded_image->planes[AOM_PLANE_Y], decoded_image->stride[AOM_PLANE_Y],
-        decoded_image->planes[AOM_PLANE_U], decoded_image->stride[AOM_PLANE_U],
-        decoded_image->planes[AOM_PLANE_V], decoded_image->stride[AOM_PLANE_V],
-        buffer->MutableDataY(), buffer->StrideY(), buffer->MutableDataU(),
-        buffer->StrideU(), buffer->MutableDataV(), buffer->StrideV(),
-        decoded_image->d_w, decoded_image->d_h);
-
-    //static std::fstream f("a.yuv", std::ios::binary | std::ios::out);
-    //f << std::string((char*)buffer->DataY(),
-    //                 buffer->width() * buffer->height() * 3 / 2);
-  }
-
-  obus["obus"] = open_bitstream_unit(bitstream->data(), bitstream->size());
-
-  return obus;
-}
-
-// https://aomediacodec.github.io/av1-spec/av1-spec.pdf 5.3.1  Last modified: 2019-01-08 11:48 PT
-nlohmann::json PayloadAV1::open_bitstream_unit(const uint8_t* buff,
-                                               uint16_t length) {
-  nlohmann::json obus = nlohmann::json::array();
-  uint16_t offset{0};
-  while (offset < length) {
-    uint8_t obu_header = buff[offset];
-    uint16_t type = (obu_header & 0b0111'1000) >> 3;
-    uint16_t has_extension = (obu_header & 0b0000'0100) >> 2;
-    uint16_t has_size_field = (obu_header & 0b0000'0010) >> 1;
-    uint16_t temporal_layer_id{0};
-    uint16_t spatial_layer_id{0};
-    offset += 1;
-    if (has_extension) {
-      uint8_t extension_header = buff[offset];
-      temporal_layer_id = (obu_header & 0b1110'0000) >> 5;
-      spatial_layer_id = (obu_header & 0b0001'1000) >> 3;
-      offset += 1;
-    }
-    if (has_size_field) {
-      uint64_t length_field_size_payload{0};
-      offset += leb128(buff + offset, length_field_size_payload);
-      offset += length_field_size_payload;
-    } else {
-      offset = length;
-    }
-    nlohmann::json obu = {{"obu_header",
-                            {{"type", type},
-                             {"has_extension", has_extension},
-                             {"has_size_field", has_size_field},
-                             {"temporal_layer_id", temporal_layer_id},
-                             {"spatial_layer_id", spatial_layer_id}}}};
-
-    uint16_t size6 = sizeof(void*);
-
-    auto* ctx = (aom_codec_alg_priv_t*)context_->priv;
-    if (type == OBU_SEQUENCE_HEADER) {
-      obus.push_back(obu_sequence_header());
-    } else if (type == OBU_TEMPORAL_DELIMITER) {
-      obus.push_back(obu_temporal_delimiter());
-    } else if (type == OBU_FRAME_HEADER) {
-      obus.push_back(obu_frame());
-    } else if (type == OBU_REDUNDANT_FRAME_HEADER) {
-      obus.push_back(obu_frame());
-    } else if (type == OBU_TILE_GROUP) {
-      obus.push_back(obu_tile_group());
-    } else if (type == OBU_METADATA) {
-      obus.push_back(obu_metadata());
-    } else if (type == OBU_FRAME) {
-      obus.push_back(obu_frame());
-    } else if (type == OBU_TILE_LIST) {
-      obus.push_back(obu_tile_list());
-    } else if (type == OBU_PADDING) {
-      obus.push_back(obu_padding());
-    } else {
-    }
-  }
-  return obus;
-
-/*
-  obu_header
-    obu_forbidden_bit 必须设置为0
-    obu_type 指定了OBU负载中包含的数据结构类型
-
+   +-----------------------+-----------+-----------+-------------------+
+   | Configuration         | Mode      | Bandwidth | Frame Sizes       |
+   | Number(s)             |           |           |                   |
+   +-----------------------+-----------+-----------+-------------------+
+   | 0...3                 | SILK-only | NB        | 10, 20, 40, 60 ms |
+   |                       |           |           |                   |
+   | 4...7                 | SILK-only | MB        | 10, 20, 40, 60 ms |
+   |                       |           |           |                   |
+   | 8...11                | SILK-only | WB        | 10, 20, 40, 60 ms |
+   |                       |           |           |                   |
+   | 12...13               | Hybrid    | SWB       | 10, 20 ms         |
+   |                       |           |           |                   |
+   | 14...15               | Hybrid    | FB        | 10, 20 ms         |
+   |                       |           |           |                   |
+   | 16...19               | CELT-only | NB        | 2.5, 5, 10, 20 ms |
+   |                       |           |           |                   |
+   | 20...23               | CELT-only | WB        | 2.5, 5, 10, 20 ms |
+   |                       |           |           |                   |
+   | 24...27               | CELT-only | SWB       | 2.5, 5, 10, 20 ms |
+   |                       |           |           |                   |
+   | 28...31               | CELT-only | FB        | 2.5, 5, 10, 20 ms |
+   +-----------------------+-----------+-----------+-------------------+
+                                Table 2: TOC Byte Configuration Parameters
 */
-}
-
-uint32_t PayloadAV1::leb128(const uint8_t* buff, uint64_t& value) {
-  value = 0;
-  uint16_t i{0};
-  for (i = 0; i < 8; i++) {
-    uint8_t leb128_byte = buff[i];
-    value |= ((leb128_byte & 0x7f) << (i * 7));
-    if (!(leb128_byte & 0x80)) {
-      break;
-    }
-  }
-  return i + 1;
-}
-
-nlohmann::json PayloadAV1::obu_sequence_header() {
-  auto* ctx = (aom_codec_alg_priv_t*)context_->priv;
-  AVxWorker* worker = get_worker(ctx);
-  FrameWorkerData* const frame_worker_data = (FrameWorkerData*)worker->data1;
-  AV1Decoder* pbi = frame_worker_data->pbi;
-
-  SequenceHeader* const seq_params = pbi->common.seq_params;
-
-  nlohmann::json obu = {
-      {"obu_type", "obu_sequence_header"},
-      {"size", pbi->obu_size_hdr.size},
-      {"seq_profile", seq_params->profile},
-      {"still_picture", seq_params->still_picture},
-      {"reduced_still_picture_header", seq_params->reduced_still_picture_hdr},
-      {"timing_info_present_flag", seq_params->timing_info_present},
-      {"decoder_model_info_present_flag", seq_params->decoder_model_info_present_flag},
-      {"initial_display_delay_present_flag", seq_params->display_model_info_present_flag},
-      {"operating_points_cnt_minus_1", seq_params->operating_points_cnt_minus_1},
-      {"operating_points", nlohmann::json::array()},
-      {"frame_width_bits", seq_params->num_bits_width},
-      {"frame_height_bits", seq_params->num_bits_height},
-      {"max_frame_width", seq_params->max_frame_width},
-      {"max_frame_height", seq_params->max_frame_height},
-      {"frame_id_numbers_present_flag", seq_params->frame_id_numbers_present_flag},
-      {"delta_frame_id_length", seq_params->delta_frame_id_length},
-      {"additional_frame_id_length", seq_params->frame_id_length - seq_params->delta_frame_id_length},
-      {"use_128x128_superblock", seq_params->sb_size},  // 15:128 12:64
-      {"enable_filter_intra", seq_params->enable_filter_intra},
-      {"enable_intra_edge_filter", seq_params->enable_intra_edge_filter},
-      {"enable_interintra_compound", seq_params->enable_interintra_compound},
-      {"enable_masked_compound", seq_params->enable_masked_compound},
-      {"enable_warped_motion", seq_params->enable_warped_motion},
-      {"enable_dual_filter", seq_params->enable_dual_filter},
-      {"enable_order_hint", seq_params->order_hint_info.enable_order_hint},
-      {"enable_jnt_comp", seq_params->order_hint_info.enable_dist_wtd_comp},
-      {"enable_ref_frame_mvs", seq_params->order_hint_info.enable_ref_frame_mvs},
-      {"seq_force_screen_content_tools", seq_params->force_screen_content_tools},
-      {"seq_force_integer_mv", seq_params->force_integer_mv},
-      {"order_hint_bits_minus_1", seq_params->order_hint_info.order_hint_bits_minus_1},
-      {"enable_superres", seq_params->enable_superres},
-      {"enable_cdef", seq_params->enable_cdef},
-      {"enable_restoration", seq_params->enable_restoration},
-      {"film_grain_params_present", seq_params->film_grain_params_present},
-      {"spatial_layers", pbi->number_spatial_layers},
-      {"temporal_layers", pbi->number_temporal_layers},
-
-      {"bitdepth", seq_params->bit_depth},
-      {"mono_chrome", seq_params->monochrome},
-      {"color_primaries", seq_params->color_primaries},
-      {"transfer_characteristics", seq_params->transfer_characteristics},
-      {"matrix_coefficients", seq_params->matrix_coefficients},
-      {"color_range", seq_params->color_range},
-      {"subsampling_x", seq_params->subsampling_x},
-      {"subsampling_y", seq_params->subsampling_y},
-      {"chroma_sample_position", seq_params->chroma_sample_position},
-      {"separate_uv_delta_q", seq_params->separate_uv_delta_q},
-  };
-  if (seq_params->timing_info_present) {
-    aom_timing_info_t* timing_info = &seq_params->timing_info;
-    obu["timing_info"] = {
-        {"num_units_in_display_tick", timing_info->num_units_in_display_tick},
-        {"time_scale", timing_info->time_scale},
-        {"equal_picture_interval", timing_info->equal_picture_interval},
-        {"num_ticks_per_picture", timing_info->num_ticks_per_picture},
-    };
-  }
-  if (seq_params->decoder_model_info_present_flag) {
-    aom_dec_model_info_t* decoder_model_info = &seq_params->decoder_model_info;
-    obu["decoder_model_info"] = {
-        {"buffer_delay_length",
-         decoder_model_info->encoder_decoder_buffer_delay_length},
-        {"num_units_in_decoding_tick",
-         decoder_model_info->num_units_in_decoding_tick},
-        {"buffer_removal_time_length",
-         decoder_model_info->buffer_removal_time_length},
-        {"frame_presentation_time_length",
-         decoder_model_info->frame_presentation_time_length},
-    };
-    for (int i = 0; i <= seq_params->operating_points_cnt_minus_1; i++) {
-      obu["operating_points"].push_back({
-          {"operating_point_idc", seq_params->operating_point_idc[i]},
-          {"seq_level_idx", seq_params->seq_level_idx[i]},
-          {"seq_tier", seq_params->tier[i]},
-          {"decoder_model_present_for_this_op",
-           seq_params->op_params[i].decoder_model_param_present_flag},
-          {"initial_display_delay_present_for_this_op",
-           seq_params->op_params[i].display_model_param_present_flag},
-          {"initial_display_delay",
-           seq_params->op_params[i].initial_display_delay},
-      });
-      if (seq_params->op_params[i].decoder_model_param_present_flag) {
-        aom_dec_model_op_parameters_t* op_params = &seq_params->op_params[i];
-        obu["operating_points"]["decoder_buffer_delay"] =
-            op_params->decoder_buffer_delay;
-        obu["operating_points"]["encoder_buffer_delay"] =
-            op_params->encoder_buffer_delay;
-        obu["operating_points"]["low_delay_mode_flag"] =
-            op_params->low_delay_mode_flag;
-      }
-    }
-  }
-  return obu;
-}
-
-nlohmann::json PayloadAV1::obu_temporal_delimiter() {
-  return {
-      {"obu_type", "obu_temporal_delimiter"},
-  };
-}
-
-nlohmann::json PayloadAV1::obu_frame_header() {
-  return {
-      {"obu_type", "obu_frame_header"},
-  };
-}
-
-nlohmann::json PayloadAV1::obu_redundant_frame_header() {
-  return {
-      {"obu_type", "obu_redundant_frame_header"},
-  };
-}
-
-nlohmann::json PayloadAV1::obu_tile_group() {
-  return {
-      {"obu_type", "obu_tile_group"},
-  };
-}
-
-nlohmann::json PayloadAV1::obu_metadata() {
-  return {
-      {"obu_type", "obu_metadata"},
-  };
-}
-
-nlohmann::json PayloadAV1::obu_frame() {
-  auto* ctx = (aom_codec_alg_priv_t*)context_->priv;
-  AVxWorker* worker = get_worker(ctx);
-  FrameWorkerData* const frame_worker_data = (FrameWorkerData*)worker->data1;
-  AV1Decoder* pbi = frame_worker_data->pbi;
-  AV1_COMMON* const cm = &pbi->common;
-  const SequenceHeader* const seq_params = cm->seq_params;
-  CurrentFrame* const current_frame = &cm->current_frame;
-  FeatureFlags* const features = &cm->features;
-  MACROBLOCKD* const xd = &pbi->dcb.xd;
-  BufferPool* const pool = cm->buffer_pool;
-  RefCntBuffer* const frame_bufs = pool->frame_bufs;
-  aom_s_frame_info* sframe_info = &pbi->sframe_info;
-
-  if (seq_params->reduced_still_picture_hdr) {
-    return nlohmann::json();
-  }
-
-  nlohmann::json obu = {
-      {"obu_type", "obu_frame"},
-      {"show_existing_frame", cm->show_existing_frame},
-      {"frame_presentation_time", cm->frame_presentation_time},
-      {"frame_type", current_frame->frame_type},
-      {"show_frame", cm->show_frame},
-      {"showable_frame", cm->showable_frame},
-      {"error_resilient_mode", features->error_resilient_mode},
-      {"disable_cdf_update", features->disable_cdf_update},
-      {"allow_screen_content_tools", features->allow_screen_content_tools},
-      {"force_integer_mv", features->cur_frame_force_integer_mv},
-      {"current_frame_id", cm->current_frame_id},
-      {"order_hint", current_frame->order_hint},
-      {"primary_ref_frame", features->primary_ref_frame},
-      {"buffer_removal_time_present_flag", pbi->buffer_removal_time_present},
-      {"buffer_removal_time", nlohmann::json::array()},
-      {"refresh_frame_flags", current_frame->refresh_frame_flags},  // 15:128 12:64
-      {"ref_order_hint", nlohmann::json::array()},
-      {"allow_intrabc", features->allow_intrabc},
-      {"frame_refs_short_signaling", seq_params->enable_interintra_compound},
-      {"ref_frame_idx", nlohmann::json::array()},
-      {"allow_high_precision_mv", features->allow_high_precision_mv},
-      {"interp_filter", features->interp_filter},
-      {"is_motion_mode_switchable", features->switchable_motion_mode},
-      {"use_ref_frame_mvs", features->allow_ref_frame_mvs},
-      {"refresh_frame_context", features->refresh_frame_context},
-      {"allow_warped_motion", features->allow_warped_motion},
-      {"reduced_tx_set", features->reduced_tx_set_used},
-  };
-  if (pbi->buffer_removal_time_present) {
-    for (int op_num = 0; op_num < seq_params->operating_points_cnt_minus_1 + 1; op_num++) {
-      obu["buffer_removal_time"].push_back(cm->buffer_removal_times[op_num]);
-    }
-  }
-  if (!(cm->current_frame.frame_type == KEY_FRAME ||
-        cm->current_frame.frame_type == INTRA_ONLY_FRAME) ||
-      current_frame->refresh_frame_flags != 0xFF) {
-    if (features->error_resilient_mode &&
-        seq_params->order_hint_info.enable_order_hint) {
-      for (int ref_idx = 0; ref_idx < REF_FRAMES; ref_idx++) {
-        obu["ref_order_hint"].push_back(cm->ref_frame_map[ref_idx]->order_hint);
-      }
-    }
-  }
-  for (int i = 0; i < INTER_REFS_PER_FRAME; ++i) {
-    obu["ref_frame_idx"].push_back(cm->remapped_ref_idx[i]);
-  }
-
-  if (seq_params->decoder_model_info_present_flag &&
-      seq_params->timing_info.equal_picture_interval == 0) {
-  }
-  return obu;
-}
-
-nlohmann::json PayloadAV1::obu_tile_list() {
-  return {
-      {"obu_type", "obu_tile_list"},
-  };
-}
-
-nlohmann::json PayloadAV1::obu_padding() {
-  return {
-      {"obu_type", "obu_padding"},
-  };
-}
-
-//nlohmann::json PayloadAV1::obu_header() {
-//  std::ostringstream oss;
-//
-//  uint32_t obu_forbidden_bit{0};            // 为0
-//  obu_type = 0;                   // 取值范围1-8,15；其他值保留
-//  obu_extension_flag = 0;  // 扩展字段
-//  obu_has_size_field = 0; // 有obu size字段
-//  uint32_t obu_reserved_1bit = 0;  //为0，保留字段
-//  buffer_->ReadBits(&obu_forbidden_bit, 1); // f(1)  保留字段
-//  buffer_->ReadBits(&obu_type, 4); // f(4)
-//  buffer_->ReadBits(&obu_extension_flag, 1); // f(1)
-//  buffer_->ReadBits(&obu_has_size_field, 1); // f(1)
-//  buffer_->ReadBits(&obu_reserved_1bit, 1); // f(1)  保留字段
-//
-//  oss << obu_type << "(" << obuType2String[(OBU_TYPE)obu_type] << ")";
-//  nlohmann::json json = {
-//      {"obu_forbidden_bit", obu_forbidden_bit},
-//      {"obu_type", oss.str()},
-//      {"obu_extension_flag", obu_extension_flag},
-//      {"obu_has_size_field", obu_has_size_field},
-//      {"obu_reserved_1bit", obu_reserved_1bit},
-//  };
-//  if (obu_extension_flag == 1) {
-//    json["obu_extension_header"] = obu_extension_header();
-//  } else {
-//    temporal_id = 0;
-//    spatial_id = 0;
-//  }
-//  return json;
-//}
-//
-//nlohmann::json PayloadAV1::obu_extension_header() {
-//  uint32_t extension_header_reserved_3bits{0};  // 为0，保留字段
-//  buffer_->ReadBits(&temporal_id, 3); // f(3)
-//  buffer_->ReadBits(&spatial_id, 2);            // f(2)
-//  buffer_->ReadBits(&extension_header_reserved_3bits, 3);  // f(3)
-//  return {
-//      {"temporal_id", temporal_id},
-//      {"spatial_id", spatial_id},
-//      {"extension_header_reserved_3bits", extension_header_reserved_3bits},
-//  };
-//}
-
+/*
+   +----------------------+-----------------+-------------------------+
+   | Abbreviation         | Audio Bandwidth | Sample Rate (Effective) |
+   +----------------------+-----------------+-------------------------+
+   | NB (narrowband)      |           4 kHz |                   8 kHz |
+   |                      |                 |                         |
+   | MB (medium-band)     |           6 kHz |                  12 kHz |
+   |                      |                 |                         |
+   | WB (wideband)        |           8 kHz |                  16 kHz |
+   |                      |                 |                         |
+   | SWB (super-wideband) |          12 kHz |                  24 kHz |
+   |                      |                 |                         |
+   | FB (fullband)        |      20 kHz (*) |                  48 kHz |
+   +----------------------+-----------------+-------------------------+
+*/
 nlohmann::json PayloadOpus::parse(const uint8_t* buff, uint16_t length) {
   std::ostringstream oss;
   uint32_t offset{0};
@@ -1795,7 +535,6 @@ nlohmann::json PayloadOpus::parse(const uint8_t* buff, uint16_t length) {
   oss.str("");
   oss << channels << "(" << channels + 1 << ")";
   opus["channels"] = oss.str();
-
   switch (packet_flag) {
     case 0:
       opus["frame"] = parseC0(buff, length);
@@ -2077,7 +816,7 @@ nlohmann::json PayloadOpus::parseC3VBR(const uint8_t* buff,
 }
 
 nlohmann::json RtpPacket::parse(const uint8_t* buff, uint16_t length) {
-  webrtc::RtpPacket rtpPacket;
+  webrtc::RtpPacketReceived rtpPacket;
   if (!rtpPacket.Parse(buff, length)) {
     RTC_LOG(LS_ERROR) << "parse rtp header error";
     return nlohmann::json();
@@ -2089,15 +828,30 @@ nlohmann::json RtpPacket::parse(const uint8_t* buff, uint16_t length) {
   if (extension) {
     json["extension"] = this->parseExtension(rtpPacket);
   }
-  if (rtpPacket.payload_size()) {
-    json["payload"] =
-        this->parsePayload(rtpPacket.PayloadBuffer(), rtpPacket.PayloadType());
-  }
 
-  if (rtpPacket.PayloadType() == 124) {
-    flexfec_->insertMediaPacket(rtpPacket);
-  } else if (rtpPacket.PayloadType() == 115) {
-    flexfec_->insertFecPacket(rtpPacket);
+  switch (rtpPacket.PayloadType()) {
+    case 124:
+      if (!video_depacketizer_) {
+      }
+    case 35:
+      if (!video_depacketizer_) {
+        video_depacketizer_ = webrtc::CreateVideoRtpDepacketizer(
+            webrtc::VideoCodecType::kVideoCodecAV1);
+        video_.reset(new PayloadAV1);
+      }
+      // Jitter Buffer
+      json["payload"] = assembleFrame(rtpPacket);
+
+      json["customize"] = {{"color1", video_->color1_},
+                           {"color2", video_->color2_}};
+      break;
+    case 107:
+    case 36:
+      break;
+    case 115:
+      break;
+    default:
+      break;
   }
   return json;
 }
@@ -2124,7 +878,8 @@ nlohmann::json RtpPacket::parse(const uint8_t* buff, uint16_t length) {
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |               padding         | Padding size  |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-nlohmann::json RtpPacket::parseHeader(const webrtc::RtpPacket& rtpPacket) {
+nlohmann::json RtpPacket::parseHeader(
+    const webrtc::RtpPacketReceived& rtpPacket) {
   const uint8_t extension = (rtpPacket.data()[0] & 0x10) >> 4;
   const uint8_t padding = rtpPacket.padding_size() ? 1 : 0;
   const uint8_t csrcCount = rtpPacket.Csrcs().size();
@@ -2164,7 +919,8 @@ nlohmann::json RtpPacket::parseHeader(const webrtc::RtpPacket& rtpPacket) {
 |                        header extension                       |
 |                             ....                              |
 */
-nlohmann::json RtpPacket::parseExtension(const webrtc::RtpPacket& rtpPacket) {
+nlohmann::json RtpPacket::parseExtension(
+    const webrtc::RtpPacketReceived& rtpPacket) {
   uint32_t extensionOffset = kFixedHeaderSize + rtpPacket.Csrcs().size() * 4;
   const uint8_t* extensionEnd = rtpPacket.data() + rtpPacket.headers_size();
   const uint8_t* ptr = rtpPacket.data() + extensionOffset +
@@ -2226,27 +982,90 @@ nlohmann::json RtpPacket::parseExtension(const webrtc::RtpPacket& rtpPacket) {
   return headerExtension;
 }
 
-nlohmann::json RtpPacket::parsePayload(const rtc::CopyOnWriteBuffer& payload,
-                                       uint8_t payloadType) {
-  const uint8_t* ptr = payload.data();
-  uint16_t len = payload.size();
-  if (payloadType == 111) {
-    if (!audio_) {
-      audio_.reset(new PayloadOpus);
+nlohmann::json RtpPacket::assembleFrame(
+    const webrtc::RtpPacketReceived& rtpPacket) {
+  webrtc::VideoRtpDepacketizerAv1 av1;
+  auto parsed = av1.Parse(rtpPacket.PayloadBuffer());
+
+  auto packet = std::make_unique<webrtc::video_coding::PacketBuffer::Packet>(rtpPacket, parsed->video_header);
+
+  webrtc::RTPVideoHeader& video_header = packet->video_header;
+  video_header.is_last_packet_in_frame = rtpPacket.Marker();
+  packet->video_payload = rtpPacket.PayloadBuffer();
+
+  packet_infos_.emplace(
+      rtpPacket.SequenceNumber(),
+      webrtc::RtpPacketInfo(
+          rtpPacket.Ssrc(), rtpPacket.Csrcs(), rtpPacket.Timestamp(),
+          absl::nullopt,
+          rtpPacket.GetExtension<webrtc::AbsoluteCaptureTimeExtension>(), 0));
+
+  auto result = packet_buffer_.InsertPacket(std::move(packet));
+  if (result.packets.size() == 0) {
+    return nlohmann::json();
+  }
+
+  // frame buffer
+  webrtc::video_coding::PacketBuffer::Packet* first_packet{nullptr};
+  int max_nack_count{0};
+  int64_t min_recv_time{0};
+  int64_t max_recv_time{0};
+  std::vector<rtc::ArrayView<const uint8_t>> payloads;
+  webrtc::RtpPacketInfos::vector_type packet_infos;
+  
+  for (auto& packet : result.packets) {
+    webrtc::RtpPacketInfo& packet_info = packet_infos_[packet->seq_num];
+    if (packet->is_first_packet_in_frame()) {
+      first_packet = packet.get();
+      max_nack_count = packet->times_nacked;
+      min_recv_time = packet_info.receive_time().ms();
+      max_recv_time = packet_info.receive_time().ms();
+      payloads.clear();
+      packet_infos.clear();
+    } else {
+      max_nack_count = std::max(max_nack_count, packet->times_nacked);
+      min_recv_time = std::min(min_recv_time, packet_info.receive_time().ms());
+      max_recv_time = std::max(max_recv_time, packet_info.receive_time().ms());
     }
-    return audio_->parse(ptr, len);
-  } else if (payloadType == 124) {
-    if (!video_) {
-      video_.reset(new PayloadH264);
+    payloads.emplace_back(packet->video_payload);
+    packet_infos.push_back(packet_info);
+
+    if (packet->is_last_packet_in_frame()) {
+      auto bitstream = video_depacketizer_->AssembleFrame(payloads);
+      if (!bitstream) {
+        // Failed to assemble a frame. Discard and continue.
+        continue;
+      }
+
+      const webrtc::video_coding::PacketBuffer::Packet& last_packet = *packet;
+      auto frame = std::make_unique<webrtc::RtpFrameObject>(
+          first_packet->seq_num,                             //
+          last_packet.seq_num,                               //
+          last_packet.marker_bit,                            //
+          max_nack_count,                                    //
+          min_recv_time,                                     //
+          max_recv_time,                                     //
+          first_packet->timestamp,                           //
+          first_packet->timestamp,  //
+          last_packet.video_header.video_timing,             //
+          first_packet->payload_type,                        //
+          first_packet->codec(),                             //
+          last_packet.video_header.rotation,                 //
+          last_packet.video_header.content_type,             //
+          first_packet->video_header,                        //
+          last_packet.video_header.color_space,              //
+          webrtc::RtpPacketInfos(std::move(packet_infos)),           //
+          std::move(bitstream));
+
+      
+      auto frames = reference_finder_.ManageFrame(std::move(frame));
+      for (auto& f : frames) {
+        return video_->parse(f->data(), f->size());
+      }
     }
-    return video_->parse(ptr, len);
-  } else if (payloadType == 35) {
-    if (!video_) {
-      video_.reset(new PayloadAV1);
-    }
-    return video_->parse(ptr, len);
-  } else if (payloadType == 115) {
-    return flexfec_->parse(ptr, len);
+  }
+  if (result.buffer_cleared) {
+    packet_infos_.clear();
   }
   return nlohmann::json();
 }
@@ -2264,7 +1083,7 @@ nlohmann::json RtxPacket::parse(const uint8_t* buff, uint16_t length) {
      |                                                               |
      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
   */
-  webrtc::RtpPacket rtpPacket;
+  webrtc::RtpPacketReceived rtpPacket;
   if (!rtpPacket.Parse(buff, length)) {
     RTC_LOG(LS_ERROR) << "parse rtp header error";
     return nlohmann::json();
