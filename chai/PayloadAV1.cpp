@@ -315,7 +315,6 @@ nlohmann::json PayloadAV1::uncompressed_header() {
   } else {
     uncompressed["show_existing_frame"] = cm->show_existing_frame;
     if (cm->show_existing_frame) {
-      uncompressed["show_existing_frame"] = cm->show_existing_frame;
       if (seq_params->decoder_model_info_present_flag &&
           seq_params->timing_info.equal_picture_interval == 0) {
         uncompressed["temporal_point_info"] = temporal_point_info(cm);
@@ -354,24 +353,27 @@ nlohmann::json PayloadAV1::uncompressed_header() {
   }
   uncompressed["refresh_frame_flags"] = current_frame->refresh_frame_flags;
   if (current_frame->frame_type == KEY_FRAME) {
-    uncompressed["frame_size"] = frame_size();
-    uncompressed["render_size"] = render_size();
+    uncompressed["frame_size"] = frame_size(cm);
+    uncompressed["render_size"] = render_size(cm);
+    if (features->allow_screen_content_tools &&
+        (cm->width == cm->superres_upscaled_width)) {
+      uncompressed["allow_intrabc"] = features->allow_intrabc;
+    }
   } else {
-    uncompressed["frame_size_with_refs"] = frame_size_with_refs();
-    uncompressed["frame_size"] = frame_size();
-    uncompressed["render_size"] = render_size();
+    uncompressed["frame_size"] = frame_size(cm);
+    uncompressed["render_size"] = render_size(cm);
     uncompressed["allow_high_precision_mv"] = features->allow_high_precision_mv;
-    uncompressed["read_interpolation_filter"] = read_interpolation_filter();
+    uncompressed["read_interpolation_filter"] = features->interp_filter;
     uncompressed["is_motion_mode_switchable"] =
         features->switchable_motion_mode;
     uncompressed["use_ref_frame_mvs"] = features->allow_ref_frame_mvs;
   }
   uncompressed["refresh_frame_context"] = features->refresh_frame_context;
-  uncompressed["tile_info"] = tile_info();
-  uncompressed["quantization_params"] = quantization_params();
-  uncompressed["segmentation_params"] = segmentation_params();
-  uncompressed["delta_q_params"] = delta_q_params();
-  uncompressed["delta_lf_params"] = delta_lf_params();
+  uncompressed["tile_info"] = tile_info(pbi);
+  uncompressed["quantization_params"] = quantization_params(cm);
+  uncompressed["segmentation_params"] = segmentation_params(cm);
+  uncompressed["delta_q_params"] = delta_q_params(cm);
+  uncompressed["delta_lf_params"] = delta_lf_params(cm);
   uncompressed["loop_filter_params"] = loop_filter_params();
   uncompressed["cdef_params"] = cdef_params();
   uncompressed["lr_params"] = lr_params();
@@ -391,32 +393,77 @@ nlohmann::json PayloadAV1::uncompressed_header() {
 nlohmann::json PayloadAV1::temporal_point_info(AV1_COMMON* const cm) {
   return {{"frame_presentation_time", cm->frame_presentation_time}};
 }
-nlohmann::json PayloadAV1::frame_size() {
-  return nlohmann::json();
+nlohmann::json PayloadAV1::frame_size(AV1_COMMON* cm) {
+  return {
+      {"frame_width", cm->superres_upscaled_width},
+      {"frame_height", cm->superres_upscaled_height},
+      //{"superres_params", superres_params()},
+      //{"compute_image_size", compute_image_size()}
+  };
 }
-nlohmann::json PayloadAV1::render_size() {
-  return nlohmann::json();
+nlohmann::json PayloadAV1::render_size(AV1_COMMON* cm) {
+  return {
+      {"render_width", cm->render_width},
+      {"render_height", cm->render_height},
+  };
 }
-nlohmann::json PayloadAV1::tile_info() {
-  return nlohmann::json();
+nlohmann::json PayloadAV1::tile_info(AV1Decoder* const pbi) {
+  AV1_COMMON* const cm = &pbi->common;
+  CommonTileParams* const tiles = &cm->tiles;
+  nlohmann::json tile = {
+      {"uniform_tile_spacing_flag", tiles->uniform_spacing},
+  };
+  if (cm->tiles.rows * cm->tiles.cols > 1) {
+    tile["context_update_tile_id"] = pbi->context_update_tile_id;
+    tile["tile_size_bytes"] = pbi->tile_size_bytes;
+  }
+  return tile;
 }
-nlohmann::json PayloadAV1::frame_size_with_refs() {
-  return nlohmann::json();
+nlohmann::json PayloadAV1::quantization_params(AV1_COMMON* cm) {
+  CommonQuantParams* const quant_params = &cm->quant_params;
+  nlohmann::json quantization = {
+      {"base_q_idx", quant_params->base_qindex},
+      {"y_dc_delta_q", quant_params->y_dc_delta_q},
+  };
+  int num_planes = cm->seq_params->monochrome ? 1 : MAX_MB_PLANE;
+  if (num_planes > 1) {
+    quantization["u_dc_delta_q"] = quant_params->u_dc_delta_q;
+    quantization["u_ac_delta_q"] = quant_params->u_ac_delta_q;
+    quantization["v_dc_delta_q"] = quant_params->v_dc_delta_q;
+    quantization["v_ac_delta_q"] = quant_params->v_ac_delta_q;
+  }
+  quantization["using_qmatrix"] = quant_params->using_qmatrix;
+  if (quant_params->using_qmatrix) {
+    quantization["qm_y"] = quant_params->qmatrix_level_y;
+    quantization["qm_u"] = quant_params->qmatrix_level_u;
+    quantization["qm_v"] = quant_params->qmatrix_level_v;
+  }
+  return quantization;
 }
-nlohmann::json PayloadAV1::read_interpolation_filter() {
-  return nlohmann::json();
+nlohmann::json PayloadAV1::segmentation_params(AV1_COMMON* const cm) {
+  struct segmentation* const seg = &cm->seg;
+  nlohmann::json segmentation = {
+      {"segmentation_enabled", seg->enabled},
+  };
+  if (!seg->enabled) {
+    segmentation["segmentation_update_map"] = seg->update_map;
+    segmentation["segmentation_temporal_update"] = seg->temporal_update;
+    segmentation["segmentation_update_data"] = seg->update_data;
+  }
+  return segmentation;
 }
-nlohmann::json PayloadAV1::quantization_params() {
-  return nlohmann::json();
+nlohmann::json PayloadAV1::delta_q_params(AV1_COMMON* const cm) {
+  return {
+      {"delta_q_res", cm->delta_q_info.delta_q_res},
+      {"delta_q_present", cm->delta_q_info.delta_q_present_flag},
+  };
 }
-nlohmann::json PayloadAV1::segmentation_params() {
-  return nlohmann::json();
-}
-nlohmann::json PayloadAV1::delta_q_params() {
-  return nlohmann::json();
-}
-nlohmann::json PayloadAV1::delta_lf_params() {
-  return nlohmann::json();
+nlohmann::json PayloadAV1::delta_lf_params(AV1_COMMON* const cm) {
+  return {
+      {"delta_lf_present", cm->delta_q_info.delta_lf_present_flag},
+      {"delta_lf_res", cm->delta_q_info.delta_lf_res},
+      {"delta_lf_multi", cm->delta_q_info.delta_lf_multi},
+  };
 }
 nlohmann::json PayloadAV1::loop_filter_params() {
   return nlohmann::json();

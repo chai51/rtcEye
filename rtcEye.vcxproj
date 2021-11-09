@@ -64,7 +64,7 @@
       <PreprocessorDefinitions>WEBRTC_WIN;NOMINMAX;WIN32;_CRT_SECURE_NO_WARNINGS;QT_NO_KEYWORDS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>advapi32.lib;comdlg32.lib;dbghelp.lib;dnsapi.lib;gdi32.lib;msimg32.lib;odbc32.lib;odbccp32.lib;oleaut32.lib;shell32.lib;shlwapi.lib;user32.lib;usp10.lib;uuid.lib;version.lib;wininet.lib;winmm.lib;winspool.lib;ws2_32.lib;delayimp.lib;kernel32.lib;ole32.lib;crypt32.lib;iphlpapi.lib;secur32.lib;dmoguids.lib;wmcodecdspuuid.lib;amstrmid.lib;msdmo.lib;strmiids.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;webrtc.lib;libssl.lib;libcrypto.lib;sdptransform.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ws2_32.lib;d3d11.lib;winmm.lib;crypt32.lib;secur32.lib;msdmo.lib;wmcodecdspuuid.lib;dmoguids.lib;dxgi.lib;strmiids.lib;webrtc.lib;libssl.lib;libcrypto.lib;sdptransform.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>../out/Debug/obj;../out/Debug;../out/Debug/obj/pc;C:\Users\lizhe\2.lib\openssl-1.1.1i\x64\Debug\lib;C:\Users\lizhe\2.lib\libmediasoupclient\build\libsdptransform\Debug;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>

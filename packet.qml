@@ -68,8 +68,8 @@ Rectangle {
                 }
                 onActiveFocusChanged: {
                     if (activeFocus) {
-                        startGradient.color = "#00BFFF";
-                        endGradient.color = "#00BFFF";
+                        startGradient.color = "#FF00FF";
+                        endGradient.color = "#FF00FF";
                     } else {
                         startGradient.color = startColor;
                         endGradient.color = endColor;

@@ -61,7 +61,7 @@ Window {
                   if (otherUser.mediaStreams.length == 0) {
                   } else {
                     const tab = tabs.createTab(otherUser.uid);
-                    tab.item.msid = otherUser.mediaStreams[0].msid;
+                    tab.item.mid = otherUser.mediaStreams[0].mid;
                   }
                 }
               }
@@ -70,7 +70,7 @@ Window {
             case "publish": {
                 const { uid, mediaStream } = msg.data;
                 const tab = tabs.createTab(uid);
-                tab.item.msid = mediaStream.msid;
+                tab.item.mid = mediaStream.mid;
                 break;
             }
             }
@@ -115,7 +115,7 @@ Window {
 
             Rectangle {
                 anchors.fill: parent
-                property string msid: ""
+                property string mid: ""
 
                 VideoOutput {
                     id: video
@@ -180,7 +180,7 @@ Window {
                     onClicked: {
                         videoFrame.direction = "recv";
                         const request = Protoo.createRequest("subscribe", {
-                            msid: msid,
+                            mid: mid,
                             constraints: { video: true, audio: true },
                         });
 
@@ -192,7 +192,7 @@ Window {
 
                             let answer = videoFrame.createAnswer();
                             const request2 = Protoo.createRequest("subscribe", {
-                                msid: data.msid,
+                                mid: data.mid,
                                 description: { type: "answer", sdp: answer },
                             });
                             console.info("subscribe send 2, %s", JSON.stringify(request2));
@@ -207,8 +207,8 @@ Window {
                         });
                     }
                 }
-                onMsidChanged: {
-                    if (msid) {
+                onMidChanged: {
+                    if (mid) {
                         publish.visible = false;
                         subscribe.visible = true;
                     } else {
